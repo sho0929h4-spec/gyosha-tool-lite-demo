@@ -1,0 +1,128 @@
+// js/notices-api.js — 工事掲示のDBアクセス（Supabase 呼び出しはここに集約）
+// 依存: NoticeLogic（js/notice-logic.js）、グローバル sb / ctx（js/supabase.js / js/app.js）
+// notices の列権限（migration 013）: room, work_name, work_date, work_date_end, work_date_tbd, data だけ更新できる。
+// 一覧用の列（room / work_name / work_date / work_date_end / work_date_tbd）は data から必ず同期する（唯一の源は data）。
+const NoticesApi = (() => {
+  const NL = () => window.NoticeLogic;
+  const must = ({ data, error }) => { if (error) throw error; return data; };
+
+  // 更新してよい列（DB の列 grant と同じ）。org_id / case_id / created_by などは画面から変えられない
+  const NOTICE_COLS = ['room', 'work_name', 'work_date', 'work_date_end', 'work_date_tbd', 'data'];
+  const pick = (obj, cols) => {
+    const out = {};
+    for (const k of cols) if (obj && Object.prototype.hasOwnProperty.call(obj, k)) out[k] = obj[k];
+    return out;
+  };
+  const clone = v => JSON.parse(JSON.stringify(v));
+
+  // 'YYYY-MM-DD' の実在する日付だけ通す。それ以外は null（DB の date 型を壊さない）
+  function dateOrNull(v) {
+    const s = String(v || '').trim();
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+    if (!m) return null;
+    const y = +m[1], mo = +m[2], d = +m[3];
+    const t = new Date(Date.UTC(y, mo - 1, d));
+    return y >= 1 && t.getUTCFullYear() === y && t.getUTCMonth() === mo - 1 && t.getUTCDate() === d ? s : null;
+  }
+  const textOrNull = v => { const s = String(v == null ? '' : v).trim(); return s ? s : null; };
+
+  // data から一覧用の列を作る。「工事日は未定」のときは日付の列を null にする
+  // （一覧の並びで未定が先頭に来る／画面の日付欄に古い値や逆転が残っていても DB の制約に当たらない。data 側の値は残す）
+  function listCols(data) {
+    const d = data || {};
+    const tbd = !!d.workDateTbd;
+    return {
+      room: textOrNull(d.roomNo),
+      work_name: textOrNull(d.workName),
+      work_date: tbd ? null : dateOrNull(d.workDate),
+      work_date_end: tbd ? null : dateOrNull(d.workDateEnd),
+      work_date_tbd: tbd
+    };
+  }
+  // DB の制約（migration 015）: room / work_name は80字まで、work_date_end は work_date 以降。違反は保存前に分かりやすく止める
+  const MAX_LEN = 80;
+  function checkCols(c) {
+    if (c.room && Array.from(c.room).length > MAX_LEN) throw new Error('号室は' + MAX_LEN + '文字までです');
+    if (c.work_name && Array.from(c.work_name).length > MAX_LEN) throw new Error('工事名称は' + MAX_LEN + '文字までです');
+    if (c.work_date && c.work_date_end && c.work_date_end < c.work_date) throw new Error('工事日の終了は開始日以降にしてください');
+  }
+  // 保存する行（data ＋ 一覧用の列）を allowlist 越しに作る
+  const patchOf = data => { const c = listCols(data); checkCols(c); return pick({ ...c, data }, NOTICE_COLS); };
+
+  // 会社マスタ（ctx.org）のスナップショット。後で会社情報を変えても過去の掲示は変わらない
+  function contactSnapshot() {
+    const o = (typeof ctx !== 'undefined' && ctx && ctx.org) || {};
+    return { company: o.name || '', address: o.address || '', tel: o.tel || '' };
+  }
+
+  const api = {
+    // 工事日の新しい順（未定・空が先頭。旧ツールと同じ）、同じ日は作成の新しい順
+    async listByCase(caseId) {
+      return must(await sb.from('notices').select('*').eq('case_id', caseId)
+        .order('work_date', { ascending: false, nullsFirst: true })
+        .order('created_at', { ascending: false }));
+    },
+    // 日報（Task 32）: 自分が作った工事掲示（sinceIso 以降）
+    async listMineSince(sinceIso) {
+      return must(await sb.from('notices').select('id, case_id, phase_id, created_at, created_by')
+        .eq('created_by', ctx.user.id).gte('created_at', sinceIso).order('created_at', { ascending: true })) || [];
+    },
+    async get(id) {
+      return must(await sb.from('notices').select('*').eq('id', id).maybeSingle());
+    },
+    // 新規作成。物件名は案件名、連絡先は会社マスタのスナップショット。
+    // opts.phase_id: 対応フェーズ（工事）のカードから作るとき。opts.data: 工事日など最初に入れておく値（workDate / timeStart 等）
+    async create(caseId, caseRow, opts = {}) {
+      const data = NL().emptyData(caseRow);
+      data.contact = contactSnapshot();
+      if (opts && opts.data) {
+        // drainRooms / otherWorkText / workTypes: 工事カードから作るときの調査結果の注意事項（作成時の初期値だけ）
+        // roomNo: 号室の初期値（この案件の部屋／関係する部屋から選んだもの。Task 12）
+        // Task 29: workName（工事名称）・workDateTbd（工事日は未定）・autoFrom（見積の提出で自動で作った印。手で保存すると消える）
+        for (const k of ['workDate', 'workDateEnd', 'timeStart', 'timeEnd', 'drainRooms', 'otherWorkText', 'roomNo', 'workName', 'autoFrom']) {
+          if (typeof opts.data[k] === 'string' && (k !== 'workName' || opts.data[k].trim())) data[k] = opts.data[k];
+        }
+        if (opts.data.workDateTbd === true) data.workDateTbd = true;
+        const wt = opts.data.workTypes;
+        if (wt && typeof wt === 'object') for (const k of Object.keys(data.workTypes)) if (wt[k] === true) data.workTypes[k] = true;
+      }
+      const row = { case_id: caseId, ...patchOf(data) };
+      if (opts && opts.phase_id) row.phase_id = opts.phase_id;
+      const made = must(await sb.from('notices').insert(row).select().single());
+      if (opts && opts.phaseTitle) { // 対応フェーズのカードから作ったときはタイムラインに記録（失敗しても作成は成功扱い）
+        try {
+          must(await sb.from('timeline_entries').insert({ case_id: caseId, type: 'system',
+            body: opts.auto ? `${opts.phaseTitle}の工事掲示を自動で作った（見積書の提出から・下書き）` : `${opts.phaseTitle}の工事掲示を作った` }));
+        } catch (e) { console.warn('自動記録に失敗', e); }
+      }
+      return made;
+    },
+    // data と一覧用の列を一緒に保存する。0行なら失敗（削除済み・権限なし）
+    async save(id, data) {
+      if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('保存する内容がありません');
+      if (data.autoFrom) { data = Object.assign({}, data); delete data.autoFrom; } // Task 29: 手で直したら「自動」の印を外す
+      const rows = must(await sb.from('notices').update(patchOf(data)).eq('id', id).select());
+      if (!rows || rows.length === 0) throw new Error('保存できませんでした（掲示が削除された可能性があります）');
+      return rows[0];
+    },
+    async remove(id) {
+      const rows = must(await sb.from('notices').delete().eq('id', id).select('id'));
+      if (!rows || rows.length === 0) throw new Error('削除できませんでした');
+    },
+    // 複製 = 号室を空にした新規 insert（連絡先のスナップショットも引き継ぐ）。別の号室用に使う
+    async duplicate(notice) {
+      const data = clone(notice.data || {});
+      data.roomNo = '';
+      const row = { case_id: notice.case_id, ...patchOf(data) };
+      if (notice.phase_id) row.phase_id = notice.phase_id; // 複製も同じフェーズ
+      return must(await sb.from('notices').insert(row).select().single());
+    },
+    // 連絡先を会社マスタの最新で上書きして保存する。更新後の行を返す
+    async refreshContact(id, data) {
+      const next = { ...clone(data || {}), contact: contactSnapshot() };
+      return api.save(id, next);
+    }
+  };
+  return api;
+})();
+window.NoticesApi = NoticesApi;

@@ -1,0 +1,542 @@
+// js/vendor.js — ⑧ 協力業者の入力ページ（r.html#{token}。ログイン不要）  （Task 6）
+// セキュリティ:
+//   ・token は URL の # 以降にだけある（# 以降はサーバーへ送られない）。DB へは RPC の引数としてだけ渡す。
+//     画面・console・localStorage には出さない（提出済みの目印だけ、token の SHA-256 の先頭を使う）。
+//   ・Supabase クライアントはセッションなし（persistSession:false 等）で作る。協力業者が同じブラウザで
+//     このアプリにログインしていても、ここは必ず anon として動く。r.html は js/supabase.js（既定の sb）を読まない。
+//   ・anon ができるのは share_open / share_submit と、自分の share フォルダへの写真の新規アップロードだけ
+//     （DB: migration 009/010。ファイル名は英数._- で .jpg、100件まで、上書き不可、読み取り・削除不可）。
+// 入力欄は ⑥ と同じもの（js/report-form.js の rfBuildForm を共有。作業者欄なし・作業区分は発行時に決まっていて変更不可）。
+// 入力内容と写真リスト（path, name, caption, phase, marks）は localStorage `share-{share_id}` に保存して再読込で復元する。
+// 写真のプレビューはこの端末で選んだ写真（blob URL）だけ。anon は Storage から読めないので、再読込後はプレビューなし。
+// PDFプレビューは出さない（anon は署名URLを作れず、ロゴ・写真を PDF に載せられないため。PDF は提出後に社内で作る）。
+// Task 33: 上部に「📋 依頼内容」1枚: 一番上に訪問する号室ごとの1行（「402号室（加害部屋）→ 原因調査・耐圧テスト」。share_open の brief = plan・
+//   case.room・phase.kind。PhaseLogic.visitTaskRows）→ 依頼内容の詳細（文章・症状・被害箇所・怪しい箇所・写真。share_open の request）。
+//   Task 31 の「🚪 今回行く部屋」の枠・Task 28 の「📝 現場への指示」の枠は無くした（中身は号室の行に）。
+//   依頼内容の写真だけは anon でも署名URLを作れる（share_request_photo_ok: 依頼内容に載っていて、ヘッダ x-share-token のトークンがこの案件の使える URL のとき。055）。依頼元の連絡先・金額は出さない。
+//   入居者の電話は既定で出さない。「🕒 到着が遅れそう」→ シート → share_report_late（管理者に自動の連絡）→ 入居者の電話（share_open の residents）を出す
+(() => {
+  'use strict';
+  const client = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false, storageKey: 'genba-vendor' }
+  });
+  const token = location.hash.slice(1);
+  const MAX_PHOTOS = 100;
+  const FILE_RE = /^[A-Za-z0-9._-]+\.jpe?g$/i;
+  const $ = id => document.getElementById(id);
+  const el = rfMk;
+  let s = null; // 表示中の入力セッション
+
+  // # を書き換えたら別のURLとして開き直す
+  window.addEventListener('hashchange', () => location.reload());
+
+  /* ---------- 補助 ---------- */
+  const errMsg = e => (e && e.message ? String(e.message) : '通信に失敗しました。電波の良いところでもう一度お試しください');
+  const pad = n => String(n).padStart(2, '0');
+  const today = () => { const d = new Date(); return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()); };
+  const fmtDue = iso => {
+    const d = new Date(iso);
+    return isNaN(d.getTime()) ? '' : (d.getMonth() + 1) + '/' + d.getDate() + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  };
+  // 頭文字: 「株式会社」「(株)」などは飛ばす
+  const initial = name => {
+    const t = String(name || '').replace(/^(株式会社|有限会社|合同会社|合資会社|合名会社|[(（][株有][)）])\s*/, '').trim();
+    return Array.from(t || String(name || '') || '？')[0];
+  };
+  async function tokenMark() {
+    return 'share-done-' + (await CryptoUtil.sha256Hex(token)).slice(0, 32); // 先頭16バイト = 32文字
+  }
+  const lsGet = k => { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } };
+  const lsSet = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* 容量不足など */ } };
+  const lsDel = k => { try { localStorage.removeItem(k); } catch (e) { /* 何もしない */ } };
+
+  /* ---------- 全画面メッセージ ---------- */
+  function full(icon, title, text, retry, extra) {
+    $('v-bar').hidden = true;
+    const box = el('div', 'v-full');
+    box.id = 'v-full';
+    box.append(el('div', 'v-icon'), el('h1', null, title));
+    if (icon) box.firstChild.appendChild(Icon.el(icon, { size: 40 }));
+    if (text) box.appendChild(el('p', null, text));
+    if (retry) {
+      const b = el('button', 'btn ghost', 'もう一度読み込む');
+      b.type = 'button';
+      b.addEventListener('click', retry);
+      box.appendChild(b);
+    }
+    if (extra) box.appendChild(extra);
+    $('v-root').replaceChildren(box);
+  }
+
+  // Task 65: 現地確認の記録（work_type site_check）は「記録」「送信」と呼ぶ（share_state / share_open の work_type で決める）
+  let words = { doc: '報告書', vb: '提出', rec: false };
+  const setWords = wt => { words = ReportLogic.isRecord(wt) ? { doc: '現地確認の記録', vb: '送信', rec: true } : { doc: '報告書', vb: '提出', rec: false }; };
+
+  /* ---------- 提出後の再編集（Task 35。依頼元へ送る前まで） ---------- */
+  // 「再編集して管理者に知らせる」→ 画面内で確かめる（confirm は使わない）→ share_reedit → 開き直す（同じ URL で入力・提出できる）
+  function reeditBox(orgName) {
+    const box = el('div', 'v-reedit');
+    box.id = 'v-reedit';
+    box.appendChild(el('p', null, '内容を直したいときは、' + (orgName || '依頼元の会社') + 'が依頼元へ送る前なら、ここから直せます。'));
+    const b = el('button', 'btn', '再編集して管理者に知らせる');
+    b.type = 'button';
+    b.id = 'v-reedit-btn';
+    const msg = el('div', 'err');
+    msg.id = 'v-reedit-msg';
+    msg.setAttribute('role', 'alert');
+    b.addEventListener('click', () => {
+      if (box.querySelector('.v-ask')) return;
+      const ask = el('div', 'v-ask');
+      ask.id = 'v-reedit-ask';
+      ask.setAttribute('role', 'alertdialog');
+      ask.appendChild(el('div', 'v-ask-t', words.doc + 'を再編集にしますか？\n編集できる状態に戻ります。直して「' + words.vb + 'する」を押すまで、' + (orgName || '依頼元の会社') + 'の画面では「再編集中」になります。再編集にしたことは自動で知らせます。'));
+      const acts = el('div', 'v-ask-acts');
+      const no = el('button', 'btn ghost', 'やめる');
+      no.type = 'button';
+      no.id = 'v-reedit-no';
+      const ok = el('button', 'btn', '再編集にする');
+      ok.type = 'button';
+      ok.id = 'v-reedit-ok';
+      no.addEventListener('click', () => { ask.remove(); b.disabled = false; });
+      ok.addEventListener('click', async () => {
+        ok.disabled = true; no.disabled = true;
+        msg.textContent = '';
+        let error = null;
+        try { ({ error } = await client.rpc('share_reedit', { p_token: token })); }
+        catch (e) { error = e; }
+        if (error) { ok.disabled = false; no.disabled = false; msg.textContent = '再編集にできませんでした: ' + errMsg(error); return; }
+        lsDel(await tokenMark());
+        reeditedNow = true;
+        boot();
+      });
+      acts.append(no, ok);
+      ask.append(acts);
+      b.disabled = true;
+      box.insertBefore(ask, msg);
+    });
+    box.append(b, msg);
+    return box;
+  }
+  let reeditedNow = false; // 再編集にした直後（開き直した入力画面にお知らせを出す）
+  // share_open が開けないとき: 提出済み（再編集できる）／送付済み／その他 を share_state で見分ける
+  async function submittedView(fallback) {
+    let st = null;
+    try { const res = await client.rpc('share_state', { p_token: token }); if (!res.error) st = res.data; }
+    catch (e) { st = null; }
+    const orgName = st && st.org ? st.org.name : '';
+    if (st) setWords(st.work_type);
+    if (st && st.can_reedit) {
+      full('checkCircle', 'この' + words.doc + 'は' + words.vb + '済みです', words.vb + 'はすでに完了しています。ありがとうございました。', null, reeditBox(orgName));
+      return true;
+    }
+    if (st && st.status === 'sent') {
+      full('checkCircle', 'この報告書は依頼元へ送付済みです', '送付済みのため、ここからは直せません。内容を直したいときは' + (orgName || '依頼元の会社') + 'にご連絡ください。');
+      return true;
+    }
+    return fallback();
+  }
+
+  /* ---------- 読み込み ---------- */
+  async function boot() {
+    if (!/^[A-Za-z0-9_-]{20,200}$/.test(token)) {
+      full('alert', 'URLが正しくありません', '届いたURLを最後までそのまま開いてください。分からない場合は依頼元の会社にご連絡ください。');
+      return;
+    }
+    full('clock', '読み込み中…');
+    let res;
+    try { res = await client.rpc('share_open', { p_token: token }); }
+    catch (e) { res = { data: null, error: e }; }
+    if (res.error || !res.data) {
+      const m = errMsg(res.error);
+      const mark = lsGet(await tokenMark());
+      // Task 35: 提出済み（依頼元へ送る前）なら「再編集して管理者に知らせる」。送付済みは連絡を案内
+      await submittedView(async () => {
+        if (mark) {
+          full('checkCircle', 'この報告書は提出済みです', '提出はすでに完了しています。ありがとうございました。内容の変更が必要な場合は依頼元の会社にご連絡ください。');
+        } else if (/無効|期限切れ|提出/.test(m)) {
+          full('alert', m, '依頼元の会社に、新しいURLの発行をご依頼ください。');
+        } else {
+          full('alert', '読み込めませんでした', m, () => boot());
+        }
+      });
+      return;
+    }
+    start(res.data);
+  }
+
+  function start(info) {
+    const r = info.report || {};
+    const key = 'share-' + info.share_id;
+    const wt = ReportLogic.MODES[r.work_type] ? r.work_type : 'investigate';
+    setWords(wt);
+    s = {
+      info, key, ro: false, els: {}, blobs: new Map(),
+      f: {
+        work_type: wt,
+        room: r.room || '',
+        work_date: r.work_date ? String(r.work_date).slice(0, 10) : '',
+        time_start: r.time_start ? String(r.time_start).slice(0, 5) : '',
+        time_end: r.time_end ? String(r.time_end).slice(0, 5) : '',
+        data: ReportLogic.normalizeData(r.data)
+      },
+      report: { photos: [] },
+      photoBusy: false, submitting: false, done: false,
+      onDirty: () => { saveLocal(); clearVal(); },
+      alive: () => s && !s.done
+    };
+    const restored = restoreLocal();
+    // Task 35: 再編集で戻した報告書は、提出済みの写真をサーバーから（端末に保存が無いとき。プレビューは出せない）
+    if (!restored && Array.isArray(r.photos) && r.photos.length) {
+      s.report.photos = r.photos.filter(p => p && typeof p.path === 'string').slice(0, MAX_PHOTOS).map(p => ({
+        path: p.path, name: typeof p.name === 'string' ? p.name.slice(0, 120) : '', caption: typeof p.caption === 'string' ? p.caption.slice(0, 200) : '',
+        ...ReportLogic.photoPhaseOut({ phase: typeof p.phase === 'string' ? p.phase : '', phaseNote: typeof p.phaseNote === 'string' ? p.phaseNote : '' }),
+        marks: PhotoMarks.normalize(p.marks)
+      }));
+    }
+    s.reedit = Number(r.reedit_count) > 0;
+    if (!s.f.work_date) s.f.work_date = today();
+    build(restored);
+  }
+
+  /* ---------- 端末への保存 ---------- */
+  function saveLocal() {
+    if (!s || s.done) return;
+    const f = s.f;
+    lsSet(s.key, {
+      t: Date.now(),
+      f: { room: f.room, work_date: f.work_date, time_start: f.time_start, time_end: f.time_end, data: f.data },
+      photos: s.report.photos.map(p => ({ path: p.path, name: p.name, caption: p.caption || '', phase: p.phase || '', phaseNote: p.phaseNote || '', marks: PhotoMarks.normalize(p.marks) }))
+    });
+  }
+  // 壊れた値・他の share の写真は捨てる
+  function restoreLocal() {
+    const o = lsGet(s.key);
+    if (!o || typeof o !== 'object' || !o.f || typeof o.f !== 'object') return false;
+    ['room', 'work_date', 'time_start', 'time_end'].forEach(k => { if (typeof o.f[k] === 'string') s.f[k] = o.f[k]; });
+    if (o.f.data && typeof o.f.data === 'object' && !Array.isArray(o.f.data)) s.f.data = ReportLogic.normalizeData(o.f.data);
+    const prefix = s.info.upload_prefix;
+    const seen = new Set();
+    const server = new Set(((s.info.report && s.info.report.photos) || []).map(p => p && p.path).filter(Boolean)); // Task 35: 提出済みの写真
+    s.report.photos = (Array.isArray(o.photos) ? o.photos : []).filter(p => {
+      if (!p || typeof p.path !== 'string') return false;
+      if (server.has(p.path) && !seen.has(p.path)) { seen.add(p.path); return true; }
+      if (!p.path.startsWith(prefix)) return false;
+      if (!FILE_RE.test(p.path.slice(prefix.length)) || seen.has(p.path)) return false;
+      seen.add(p.path);
+      return true;
+    }).slice(0, MAX_PHOTOS).map(p => ({
+      path: p.path,
+      name: typeof p.name === 'string' ? p.name.slice(0, 120) : '',
+      caption: typeof p.caption === 'string' ? p.caption.slice(0, 200) : '',
+      // Task 21: 区分は今の5つにそろえる（古い下書きの旧区分も読み替え。自由記載は phaseNote）
+      ...ReportLogic.photoPhaseOut({ phase: typeof p.phase === 'string' ? p.phase : '', phaseNote: typeof p.phaseNote === 'string' ? p.phaseNote : '' }),
+      marks: PhotoMarks.normalize(p.marks)
+    }));
+    return true;
+  }
+
+  /* ---------- 画面 ---------- */
+  function build(restored) {
+    const info = s.info, L = ReportLogic;
+    const orgName = (info.org && info.org.name) || '';
+    document.title = (words.rec ? '現地確認の記録の入力' : '作業報告書の入力') + (orgName ? '｜' + orgName : '');
+    $('v-submit').textContent = words.vb + 'する';
+    if ($('v-sub')) $('v-sub').textContent = words.rec ? '現地確認の記録の入力をお願いします' : '作業報告書の入力をお願いします';
+    $('v-logo').textContent = initial(orgName);
+    $('v-org').textContent = orgName;
+    $('v-hdr').hidden = false;
+    // Task 30: 物件名と号室の帯（スクロールしても見える）
+    CaseBand.set($('v-place'), info.case);
+    $('v-band').hidden = !$('v-place').textContent;
+
+    const nodes = [];
+    const head = el('div', 'rep-card');
+    const top = el('div', 'rep-between');
+    const vname = el('b', null, (String(info.vendor_name || '').trim() || '担当者') + ' 様'); // 名前は任意（空なら「担当者 様」。Task 24）
+    vname.id = 'v-vendor';
+    top.appendChild(vname);
+    if (info.expires_at) { // 期限なし（null）のURLは期限を出さない
+      const due = el('span', 'rep-pill', '入力期限 ' + fmtDue(info.expires_at));
+      due.id = 'v-due';
+      top.appendChild(due);
+    }
+    head.appendChild(top);
+    const dl = el('dl', 'rep-auto');
+    dl.id = 'v-info';
+    [['物件名', info.case && info.case.name], ['現場住所', info.case && info.case.address], ['作業区分', L.WORK_TYPE_LABEL[s.f.work_type]]]
+      .forEach(([k, v]) => { dl.appendChild(el('dt', null, k)); dl.appendChild(el('dd', null, v || '—')); });
+    head.appendChild(dl);
+    // Task 28: 到着が遅れそう（フェーズのある報告書だけ）→ 報告後は入居者の電話
+    if (info.late_ok) {
+      s.els.late = lateBox();
+      head.appendChild(s.els.late);
+    }
+    nodes.push(head);
+    // Task 33: 「📋 依頼内容」1枚（号室ごとの1行＝指示 → 依頼内容の詳細）。フェーズの無い報告書は詳細だけ（あれば）
+    const req = requestCard();
+    if (req) nodes.push(req);
+
+    const note = el('div', 'rep-note', words.rec
+      ? '途中で閉じても、入力内容と写真のリストはこの端末に保存されます。送信すると' + (orgName || '依頼元の会社') + 'に知らせが届きます。送信した後も「再編集」で直せます。'
+      : '途中で閉じても、入力内容と写真のリストはこの端末に保存されます。提出後は、依頼元へ送る前なら「再編集」で直せます。' +
+        '提出された内容は' + (orgName || '依頼元の会社') + 'が確認し、報告書（PDF）にします。');
+    note.id = 'v-note';
+    if (restored) note.textContent = 'この端末に保存していた入力を復元しました。' + note.textContent;
+    nodes.push(note);
+    // Task 35: 再編集中（提出を取り消して直している）
+    if (s.reedit) {
+      const rn = el('div', 'v-reedit-note');
+      rn.id = 'v-reedit-note';
+      rn.append(el('span', 'reedit-tag', '再編集中'), el('span', null, (reeditedNow ? '再編集にしました。' : '') + '直して「' + words.vb + 'する」を押すと、' + (orgName || '依頼元の会社') + 'に自動で知らせます。'));
+      nodes.push(rn);
+    }
+    reeditedNow = false;
+
+    s.els.val = el('div', 'rep-val');
+    s.els.val.id = 'rp-val';
+    s.els.val.setAttribute('role', 'alert');
+    nodes.push(s.els.val);
+
+    nodes.push(...rfBuildForm(s, {
+      infoTitle: '号室・作業日・時間',
+      fixedMode: true,
+      photoHint: 'カメラで撮るか、アルバムから選べます。写真は自動で圧縮して、選んだ時点で送信します',
+      photoNote: L.photoNote(info.photo_rooms), // Task 25: 指示で「被害箇所の写真撮影」を選んだ号室（migration 045 share_open）
+      // Task 39: 号室の初期値 = 指示の号室（share_open の brief = plan・case.room）→ 無ければ案件の号室
+      initRooms: info.phase ? PhaseLogic.visitRooms(info.brief, info.case).rooms : null,
+      autoRoom: info.case && info.case.room
+    }));
+    s.els.photoInput.addEventListener('change', () => {
+      const files = Array.from(s.els.photoInput.files || []);
+      s.els.photoInput.value = '';
+      const phase = rfTakePhase(s); // 「鍵返却の写真を追加」から開いたときは区分 key
+      if (files.length) addPhotos(files, phase);
+    });
+    $('v-root').replaceChildren(...nodes);
+    edApplyMode(s);
+    renderPhotos();
+
+    $('v-bar').hidden = false;
+    $('v-submit').onclick = submit;
+    syncBar();
+  }
+
+  /* ---------- 依頼内容・到着が遅れそう（Task 28 / Task 33） ---------- */
+  let signed = null; // path → Promise<url>（依頼内容の写真の署名URL。まとめて1回だけ作る）
+  // migration 055: 署名URLを作れるのは、この案件の使える担当者URLのトークンを持つ人だけ。
+  // Storage の呼び出しにだけヘッダ x-share-token でトークンを渡す（policy が request.headers から読む）。画面・console には出さない
+  let photoClient = null;
+  function requestPhotoUrl(path) {
+    if (!signed) {
+      const paths = ((s.info.request && s.info.request.photos) || []).map(p => p.path);
+      if (!photoClient) {
+        photoClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+          auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false, storageKey: 'genba-vendor-photo' },
+          global: { headers: { 'x-share-token': token } }
+        });
+      }
+      const all = photoClient.storage.from('files').createSignedUrls(paths, 3600).then(({ data, error }) => {
+        if (error) throw error;
+        return new Map((data || []).filter(x => x && x.signedUrl).map(x => [x.path, x.signedUrl]));
+      });
+      signed = new Map(paths.map(p => [p, all.then(m => { if (!m.get(p)) throw new Error('写真を開けませんでした'); return m.get(p); })]));
+    }
+    return signed.get(path) || Promise.reject(new Error('写真を開けませんでした'));
+  }
+  // Task 33: 依頼内容の枠（ツールページと同じ。js/request-view.js の visitRows・build）。号室の行は share_open の brief（= plan）・case.room・phase.kind から
+  function requestCard() {
+    const info = s.info;
+    const detail = RequestView.build(info.request, { photoUrl: requestPhotoUrl, id: 'v-request-detail' });
+    if (!info.phase && !detail) return null;
+    const card = el('div', 'rep-card v-req');
+    card.id = 'v-request';
+    card.appendChild(Icon.prepend(el('h3', null, '依頼内容'), 'clipboard'));
+    if (info.phase) card.appendChild(RequestView.visitRows(info.brief, info.case, info.phase.kind, { id: 'v-visit-rows' }));
+    if (detail) card.appendChild(detail);
+    else {
+      const e = el('div', 'v-req-empty', '依頼内容の文・写真はまだ登録されていません');
+      e.id = 'v-request-empty';
+      card.appendChild(e);
+    }
+    return card;
+  }
+  function lateBox() {
+    const info = s.info;
+    const box = RequestView.residentsBox({
+      id: 'v-late',
+      late: info.late_at,
+      lateText: info.late_at ? fmtDue(info.late_at) : '',
+      residents: (info.residents || []).map(x => ({ label: PhaseLogic.briefRoomHead({ room: x.room, role: x.role }), name: x.name, tel: x.tel })),
+      onLate: () => RequestView.openLateSheet({
+        title: (info.case && info.case.name) || '',
+        onSubmit: async (minutes, note) => {
+          const { data, error } = await client.rpc('share_report_late', { p_token: token, p_minutes: minutes, p_note: note });
+          if (error) throw new Error(errMsg(error));
+          return data;
+        },
+        onDone: res => {
+          if (!s || s.done || !res) return;
+          info.late_at = res.late_at;
+          info.residents = res.residents || [];
+          const nb = lateBox();
+          if (s.els.late && s.els.late.isConnected) s.els.late.replaceWith(nb);
+          s.els.late = nb;
+        }
+      })
+    });
+    box.style.marginTop = '10px';
+    return box;
+  }
+
+  function clearVal() { if (s.els.val && s.els.val.firstChild) s.els.val.replaceChildren(); }
+  function showVal(errors, warnings) {
+    const nodes = [];
+    errors.forEach(t => nodes.push(el('div', 'rep-val-e', t)));
+    warnings.forEach(t => nodes.push(el('div', 'rep-val-w', t)));
+    s.els.val.replaceChildren(...nodes);
+    if (nodes.length) s.els.val.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  }
+  function syncBar() { $('v-submit').disabled = s.photoBusy || s.submitting; }
+
+  /* ---------- 写真 ---------- */
+  function renderPhotos() {
+    rfRenderPhotos(s, {
+      thumb(p, i) {
+        const url = s.blobs.get(p.path);
+        const nMarks = PhotoMarks.normalize(p.marks).length;
+        if (!url) {
+          const box = el('div', 'rep-ph-img rep-ph-none', 'アップロード済み（プレビューなし）' + (nMarks ? '・印 ' + nMarks + '個' : ''));
+          box.setAttribute('aria-label', 'No.' + (i + 1));
+          return box;
+        }
+        const img = el('img', 'rep-ph-img');
+        img.alt = 'No.' + (i + 1);
+        img.src = url;
+        if (nMarks) PhotoMarkEditor.thumbSrc(url, p.marks).then(u => { if (img.isConnected) img.src = u; });
+        return img;
+      },
+      // 印（Task 14）: この端末で選んだ写真（プレビューがあるもの）だけ付けられる。保存は端末（localStorage）に。提出で送る
+      canMark: p => s.blobs.has(p.path),
+      mark(i) {
+        const p = s.report.photos[i];
+        if (!p || s.photoBusy || s.submitting || s.done || !s.blobs.has(p.path)) return;
+        PhotoMarkEditor.open({
+          src: s.blobs.get(p.path),
+          marks: p.marks,
+          title: 'No.' + (i + 1) + ' に印を付ける',
+          onSave: async marks => {
+            if (s.done) throw new Error('提出済みです');
+            p.marks = marks;
+            saveLocal();
+          },
+          onClose: () => { if (s && !s.done) renderPhotos(); }
+        });
+      },
+      move(i, dir) {
+        const a = s.report.photos, j = i + (dir < 0 ? -1 : 1);
+        if (s.photoBusy || !a[i] || j < 0 || j >= a.length) return;
+        [a[i], a[j]] = [a[j], a[i]];
+        saveLocal();
+        renderPhotos();
+      },
+      async remove(i) {
+        if (s.photoBusy || !(await askPopup('この写真を一覧から外しますか？（提出しなければ報告書には入りません）', { title: '写真を外す', okLabel: '外す', danger: true })) || !s || s.photoBusy || s.done) return;
+        s.report.photos.splice(i, 1);
+        saveLocal();
+        renderPhotos();
+      },
+      after: () => { rfSyncPhotoRows(s, s.photoBusy || s.submitting); syncBar(); }
+    });
+  }
+  function photoMsg(text, isErr) {
+    s.els.photoMsg.textContent = text || '';
+    s.els.photoMsg.classList.toggle('err-on', !!isErr);
+  }
+
+  async function addPhotos(files, phase) {
+    if (s.photoBusy || s.submitting) return;
+    s.photoBusy = true;
+    renderPhotos();
+    const prefix = s.info.upload_prefix;
+    const failures = [];
+    let added = 0;
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      if (s.report.photos.length >= MAX_PHOTOS) { failures.push('写真は' + MAX_PHOTOS + '枚までです'); break; }
+      photoMsg('写真をアップロード中 ' + (i + 1) + '/' + files.length);
+      try {
+        const p = await ImageUtil.prepareFile(file);
+        if (p.type !== 'image/jpeg') throw new Error('写真ではありません');
+        const path = prefix + CryptoUtil.uuid() + '.jpg';
+        const { error } = await client.storage.from('files').upload(path, p.blob, { contentType: 'image/jpeg', upsert: false });
+        if (error) throw new Error('送信できませんでした（URLの期限切れ・無効、または写真が多すぎる可能性があります）');
+        s.blobs.set(path, URL.createObjectURL(p.blob));
+        s.report.photos.push({ path, name: String(p.name || '').slice(0, 120), caption: '', phase: phase || '' });
+        added++;
+        saveLocal();
+        renderPhotos();
+      } catch (e) {
+        failures.push('「' + file.name + '」: ' + errMsg(e));
+      }
+    }
+    s.photoBusy = false;
+    renderPhotos();
+    if (failures.length) photoMsg(failures.length + '件追加できませんでした\n' + failures.join('\n'), true);
+    else photoMsg(added + '枚追加しました');
+  }
+
+  /* ---------- 提出 ---------- */
+  async function submit() {
+    if (!s || s.photoBusy || s.submitting || s.done) return;
+    const f = s.f;
+    const photos = s.report.photos.map(p => {
+      const o = Object.assign({ path: p.path, name: p.name || '', caption: p.caption || '' }, ReportLogic.photoPhaseOut(p));
+      if (!o.phaseNote) delete o.phaseNote;
+      const marks = PhotoMarks.normalize(p.marks);
+      if (marks.length) o.marks = marks;
+      return o;
+    });
+    const cur = { work_type: f.work_type, room: f.room, work_date: f.work_date, time_start: f.time_start, time_end: f.time_end, data: f.data, photos };
+    const { errors, warnings } = ReportLogic.validate(cur);
+    showVal(errors, warnings);
+    if (errors.length) return;
+    const q = (warnings.length ? '次の点を確認してください。\n' + warnings.map(w => '・' + w).join('\n') + '\n\n' : '') +
+      (words.rec ? '送信すると管理者に知らせが届きます（あとから「再編集」で直せます）。このまま送信しますか？'
+        : '提出すると内容は変更できません（依頼元へ送る前なら、あとから「再編集」で直せます）。このまま提出しますか？');
+    if (!(await askPopup(q, { title: words.vb + 'の前に確認', okLabel: words.vb + 'する' })) || !s || s.photoBusy || s.submitting || s.done) return;
+
+    s.submitting = true;
+    const locked = [];
+    $('v-root').querySelectorAll('input,select,textarea,button').forEach(e => { if (!e.disabled) { e.disabled = true; locked.push(e); } });
+    syncBar();
+    const payload = {
+      room: String(f.room || '').trim(),
+      work_date: f.work_date,
+      time_start: f.time_start || null,
+      time_end: f.time_end || null,
+      data: ReportLogic.normalizeData(f.data),
+      photos
+    };
+    let error = null;
+    try { ({ error } = await client.rpc('share_submit', { p_token: token, p_payload: payload })); }
+    catch (e) { error = e; }
+    if (error) {
+      s.submitting = false;
+      locked.forEach(e => { e.disabled = false; });
+      renderPhotos();
+      showVal([words.vb + 'できませんでした: ' + errMsg(error)], []);
+      return;
+    }
+    s.done = true;
+    lsDel(s.key);
+    lsSet(await tokenMark(), 1);
+    s.blobs.forEach(u => URL.revokeObjectURL(u));
+    s.blobs.clear();
+    window.scrollTo(0, 0);
+    full('checkCircle', words.vb + 'しました。ありがとうございました',
+      ((s.info.org && s.info.org.name) || '依頼元の会社') + 'が内容を確認します。このページは閉じてかまいません。', null,
+      reeditBox((s.info.org && s.info.org.name) || '')); // Task 35: 依頼元へ送る前なら直せる
+  }
+
+  boot();
+})();
