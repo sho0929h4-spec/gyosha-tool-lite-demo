@@ -130,6 +130,7 @@
 //   管理者が差し戻しのやり取りに返事（staff_messages の insert で reply_to）→ 差し戻しを済みに。phase_report_overdue は報告書作成の削除中は 'dismissed'
 // migration 085（Task 68）: rpc doc_share_sent（管理者か、現場用で本人が登録した案件の本人。送付メールの下書き → 送信済み・報告書 → 送付済み・見積書 → 送付済み・
 //   紐付けた依頼を反映済み・タイムライン「302号室 調査報告書を共有した（LINE）」）・doc_share_undo（管理者だけ。下書きに戻す・ほかに送信済みが無ければ書類を戻す）
+// migration 087（Task 72）: doc_share_sent はその書類の対応（報告書・見積書の phase_id）の作業担当者も通す
 // migration 066（Task 47）: case_phases.lost_at / bill_requested_at（画面から書けない）・rpc phase_set_stage（管理者か、現場用で本人が登録した案件の本人。
 //   lost / active / wait / done / bill_requested / billed / paid。後ろの段の記録は消す・staff_messages source 'stage'（既読）・タイムライン）・
 //   phase_nudge は失注を拒否・phase_report_overdue は 'lost'。case_summaries の phases に lost_at / bill_requested_at、estimates に notes / line_texts
@@ -1926,7 +1927,11 @@ const sb = (() => {
     if (!d || (!d.report_id && !d.estimate_id)) throw P0001('共有する書類が見つかりません');
     const c = caseOf(d.case_id);
     if (!c || c.deleted_at) throw P0001('この案件は削除されています');
-    if (!(myRole() === 'owner' || fieldRegistered(c))) throw pgErr('共有できるのは、管理者と、現場用でこの案件を登録した人だけです', '42501');
+    // migration 087（Task 72）: その書類の対応（報告書・見積書の phase_id）の作業担当者も
+    const doc = d.report_id ? db.reports.find(x => x.id === d.report_id) : db.estimates.find(x => x.id === d.estimate_id);
+    const ph = doc && doc.phase_id ? db.case_phases.find(p => p.id === doc.phase_id && p.case_id === c.id) : null;
+    if (!(myRole() === 'owner' || fieldRegistered(c) || (ph && ph.worker_id === user.id)))
+      throw pgErr('共有できるのは、管理者と、その対応の作業担当者と、現場用でこの案件を登録した人だけです', '42501');
     if (d.status !== 'draft') throw P0001('すでに送付済みです。開き直してください');
     const at = nowIso();
     if (d.report_id) {
