@@ -4,7 +4,7 @@
 //   役割なし: ログインしていない状態（ログイン画面に「管理者で試す」「作業担当者で試す」）
 //   staff: 作業担当者（佐藤）・owner: 管理者（田中）
 (() => {
-  const KEY_DB = 'demo-db-v1', KEY_ROLE = 'demo-role';
+  const KEY_DB = 'demo-db-v2', KEY_ROLE = 'demo-role';
   const get = k => { try { return localStorage.getItem(k); } catch (e) { return null; } };
   const set = (k, v) => {
     try { if (v == null) localStorage.removeItem(k); else localStorage.setItem(k, v); return true; } catch (e) { return false; }
