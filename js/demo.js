@@ -6,6 +6,8 @@
 (() => {
   const D = window.__demo, F = window.__fake;
   if (!D || !F) return;
+  // Task 70: 移動の目安は Google につながず偽バックエンドの横取り（架空の30分）で見せる。キーは形だけの架空の値
+  if (!F.db.orgs[0].routes_api_key) F.db.orgs[0].routes_api_key = 'demo_not_a_real_key_0000';
 
   /* ---------- ② 保存 ---------- */
   let lastSig = null, saving = false, full = false;

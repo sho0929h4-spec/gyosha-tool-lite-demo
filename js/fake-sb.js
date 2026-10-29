@@ -150,6 +150,8 @@
 //   share_state / share_reedit（担当者URL。anon も）。再編集・再提出は staff_messages（source reedit・宛先なし）とタイムライン。
 //   share_open の report.photos・reedit_count、share_submit は報告書に入っている写真をそのまま出し直せる（使用量は数え直さない）。
 //   再調査の再提出は2つ目の調査を作らない。case_summaries の phases[].estimates / reports に reedit_mark / reedit_at / reedit_by_name / reedit_count
+// migration 086（Task 70）: memberships.survey_end_mins（既定 120・本人だけ・30〜360 の30分きざみ）・orgs.routes_api_key（管理者だけ・形の check）・
+//   routes.googleapis.com への fetch の横取り（window.__fake.routes / routesFail / routeCalls）
 // migration 078（Task 56）: purge_files（管理者だけ読む・書けない）・rpc purge_files_done（管理者だけ・まだの行だけ「消した」にして使用量を減らす）。
 //   window.__fakeFailRemove = パス で storage.remove を失敗させる
 (() => {
@@ -190,10 +192,10 @@ const sb = (() => {
 
   const db = {
     orgs: [{ id: ORG_ID, name: 'テスト工業A', plan: 'free', logo_path: null, address: '東京都新宿区1-1',
-      tel: '03-0000-0000', email: null, registration_number: null, default_margin_pct: null, created_at: nowIso() }],
+      tel: '03-0000-0000', email: null, registration_number: null, default_margin_pct: null, routes_api_key: null, created_at: nowIso() }],
     memberships: [
-      { user_id: U_ME, org_id: ORG_ID, display_name: '田中', role: 'owner', created_at: nowIso(), email: 'owner@e2e.invalid', phone: null },
-      { user_id: U_STAFF, org_id: ORG_ID, display_name: '佐藤', role: 'member', created_at: nowIso(), email: 'staff@e2e.invalid', phone: null }
+      { user_id: U_ME, org_id: ORG_ID, display_name: '田中', role: 'owner', created_at: nowIso(), email: 'owner@e2e.invalid', phone: null, survey_end_mins: 120 },
+      { user_id: U_STAFF, org_id: ORG_ID, display_name: '佐藤', role: 'member', created_at: nowIso(), email: 'staff@e2e.invalid', phone: null, survey_end_mins: 120 }
     ],
     org_usage: [{ org_id: ORG_ID, storage_bytes: 0, record_count: 0, updated_at: nowIso() }],
     invites: [],
@@ -262,7 +264,7 @@ const sb = (() => {
 
   // ---- 列権限（migration 007 / 008。ここに無い列を PATCH すると403） ----
   const UPDATE_COLS = {
-    orgs: ['name', 'address', 'tel', 'email', 'logo_path', 'registration_number', 'default_margin_pct'], // migration 015: 会社情報の列だけ（RLS は owner のみ）・036: 利益率の既定値
+    orgs: ['name', 'address', 'tel', 'email', 'logo_path', 'registration_number', 'default_margin_pct', 'routes_api_key'], // migration 015: 会社情報の列だけ（RLS は owner のみ）・036: 利益率の既定値・086: Routes API のキー
     cases: ['name', 'address', 'client_name', 'assignee_id', 'due_date', 'status', 'client_email',
       // migration 020
       'client_id', 'owner_name', 'owner_email', 'owner_tel', 'resident_name', 'resident_email', 'resident_tel',
@@ -296,7 +298,7 @@ const sb = (() => {
     estimate_presets: ['kind', 'label', 'line', 'sort'], // migration 029: 列 grant
     case_rooms: ['role', 'room', 'resident_name', 'email', 'tel', 'note', 'sort'], // migration 030: 列 grant（case_id は変えられない）
     staff_messages: ['read_at'], // migration 041: 既読だけ
-    memberships: ['display_name', 'phone'] // migration 056: 本人の担当者名・電話番号
+    memberships: ['display_name', 'phone', 'survey_end_mins'] // migration 056: 本人の担当者名・電話番号・086: 調査の終了予定の既定
   };
 
   // ---- テーブル定義: 挿入時の既定値と検証 ----
@@ -308,6 +310,8 @@ const sb = (() => {
         if (row.registration_number != null && !/^T[0-9]{13}$/.test(row.registration_number)) throw E.check('orgs', 'orgs_registration_number_check');
         // migration 036: 利益率の既定値は null か 0〜999（numeric(5,2)）
         if (row.default_margin_pct != null && !(typeof row.default_margin_pct === 'number' && row.default_margin_pct >= 0 && row.default_margin_pct <= 999)) throw E.check('orgs', 'orgs_default_margin_pct_check');
+        // migration 086: Routes API のキーは null か 英数字と - _ の 20〜100字
+        if (row.routes_api_key != null && !/^[A-Za-z0-9_-]{20,100}$/.test(row.routes_api_key)) throw E.check('orgs', 'orgs_routes_api_key_check');
       }
     },
     // migration 056: 本人だけ display_name・phone を直せる（列 grant・policy mem_update_self・前後の空白を落とすトリガー）
@@ -323,6 +327,9 @@ const sb = (() => {
         }
         if (next.phone !== old.phone) next.phone = String(next.phone == null ? '' : next.phone).trim() || null;
         if (next.phone != null && !(next.phone.length <= 30 && /^[0-9+()\- ]+$/.test(next.phone))) throw E.check('memberships', 'memberships_phone_check');
+        // migration 086: 調査の終了予定の既定は 30〜360 の30分きざみ（not null）
+        if (next.survey_end_mins !== old.survey_end_mins && !(Number.isInteger(next.survey_end_mins) && next.survey_end_mins >= 30 && next.survey_end_mins <= 360 && next.survey_end_mins % 30 === 0))
+          throw E.check('memberships', 'memberships_survey_end_mins_check');
       }
     },
     org_usage: { insert: false, update: false, del: false },
@@ -1477,6 +1484,8 @@ const sb = (() => {
         if (table === 'staff_messages' && c === 'daily_date') { out[c] = null; continue; }
         if (table === 'staff_messages' && c === 'as_client') { out[c] = false; continue; } // 065: rpc やテストが入れた古い形の行は「元請からでない」
         if (table === 'staff_messages' && c === 'meta') { out[c] = null; continue; } // 069: 日程調整のカード以外は空
+        if (table === 'memberships' && c === 'survey_end_mins') { out[c] = 120; continue; } // 086: テストが直接足したメンバーは既定（120分）
+        if (table === 'orgs' && c === 'routes_api_key') { out[c] = null; continue; } // 086: 古い形の行はキーなし
         throw pgErr(`column ${c} does not exist`, '42703');
       }
       out[c] = clone(row[c]);
@@ -3206,6 +3215,25 @@ const sb = (() => {
   };
   window.__fake.aiCalls = [];
   window.__fake.FAKE_AI = FAKE_AI;
+
+  // ---- Task 70: Google Routes API（routes.googleapis.com）は本物につながず横取りする ----
+  //   window.__fake.routes = { '出発の住所|着く住所': 秒数 }（無い組み合わせは 1800秒）。window.__fake.routesFail = true で 403
+  //   呼ばれた記録は window.__fake.routeCalls（url・headers・body。キーは hasKey / keyTail（末尾4文字）だけ残す）
+  window.__fake.routes = {};
+  window.__fake.routeCalls = [];
+  const realFetch = window.fetch.bind(window);
+  window.fetch = async (input, init) => {
+    const url = typeof input === 'string' ? input : input && input.url;
+    if (!String(url || '').startsWith('https://routes.googleapis.com/')) return realFetch(input, init);
+    const h = (init && init.headers) || {};
+    const body = JSON.parse((init && init.body) || '{}');
+    const k = h['X-Goog-Api-Key'] || '';
+    window.__fake.routeCalls.push({ url, method: init && init.method, fieldMask: h['X-Goog-FieldMask'], hasKey: !!k, keyTail: String(k).slice(-4), body });
+    await new Promise(r => setTimeout(r, 30));
+    if (window.__fake.routesFail) return new Response(JSON.stringify({ error: { code: 403, message: 'denied' } }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+    const sec = window.__fake.routes[body.origin.address + '|' + body.destination.address];
+    return new Response(JSON.stringify({ routes: [{ duration: (sec == null ? 1800 : sec) + 's', distanceMeters: 12345 }] }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
 
   return { from: t => new Query(t), rpc, storage, auth, functions };
 })();
