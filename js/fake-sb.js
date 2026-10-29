@@ -570,29 +570,43 @@ const sb = (() => {
   // migration 016: new_estimate_version(p_id, p_linked) — 自社の issued/sent の系列最新版から次版の下書きを作り、前版を superseded（1回の呼び出しで）。
   // 端数調整行（isAdjust かつ postTax）を除く・空なら空行1つ・諸経費の自動行を再計算（Math.round）・見積日=今日・有効期限+14日・
   // number null・linked は重複除去して estimates_links_guard（estimateChecks）で検査。新しい id を返す
+  // migration 088（Task 73）: p_base（元にする版。null = 最新版。同じ系列の提出したことのある版）から明細・備考・利益率・業者PDF を写す。
+  //   できるのは管理者か、自分で登録した案件（cases.created_by = 自分）の人。スタッフが作ると管理者に連絡（source reedit・宛先なし）
   function newEstimateVersion(args) {
     const a = args || {};
     const e = db.estimates.find(x => x.id === a.p_id && x.org_id === ORG_ID);
     if (!e) throw P('見積書が見つかりません');
+    const owner = myRole() === 'owner';
+    if (!owner && (caseOf(e.case_id) || {}).created_by !== user.id) throw pgErr('新しい版を作れるのは、管理者と、この案件を自分で登録した人だけです。管理者に連絡してください', '42501');
+    if (isCaseDeleted(e.case_id)) throw P('この案件は削除されています');
     const maxV = Math.max(...db.estimates.filter(x => x.series_id === e.series_id && x.org_id === ORG_ID).map(x => x.version));
     if (maxV > e.version) throw P(`第${e.version + 1}版はすでに作られています（別の画面や別の人がほぼ同時に作成しました）。見積書一覧を開き直してください`);
     if (!['issued', 'sent'].includes(e.status)) throw P('見積書の状態が変わっていたため（未提出・承諾済み・差し替え済みなど）、新しい版を作れませんでした。画面を開き直してください');
-    let lines = clone(e.lines).filter(l => !(l && l.isAdjust === true && l.postTax === true));
+    const b = a.p_base == null || a.p_base === e.id ? e : db.estimates.find(x => x.id === a.p_base && x.org_id === ORG_ID && x.series_id === e.series_id);
+    if (!b || b.status === 'draft') throw P('元にする版が見つかりません（同じ見積書の版から選んでください）');
+    let lines = clone(b.lines).filter(l => !(l && l.isAdjust === true && l.postTax === true));
     if (!lines.length) lines = [{ id: 'l' + uuid().replace(/-/g, ''), description: '', detail: '', quantity: 1, unit: '式', amount: 0 }];
     const num = v => (typeof v === 'number' ? v : (typeof v === 'string' && /^-?[0-9]+(\.[0-9]+)?$/.test(v.trim()) ? Number(v) : 0));
     const base = lines.filter(l => l.isAutoShokehi !== true && l.postTax !== true).reduce((s, l) => s + (typeof l.amount === 'number' ? l.amount : 0), 0);
     lines = lines.map(l => (l.isAutoShokehi === true ? Object.assign({}, l, { amount: Math.floor(base * num(l.shokehiPct) / 100 + 0.5) }) : l));
     const today = ymd(new Date());
-    const data = Object.assign({}, clone(e.data || {}), { issueDate: today, validUntil: plusDays(14) });
+    const data = Object.assign({}, clone(b.data || {}), { issueDate: today, validUntil: plusDays(14) });
     const linked = [];
     for (const x of (a.p_linked || [])) if (!linked.includes(x)) linked.push(x);
     if (linked.some(x => x == null)) throw P('紐付ける依頼の指定が正しくありません');
     const t = estimateTotals(lines);
     const row = T.estimates.insert({ case_id: e.case_id, series_id: e.series_id, version: e.version + 1, status: 'draft', number: null,
       data, lines, subtotal: t.subtotal, tax: t.tax, total: t.total, linked_request_ids: linked, phase_id: e.phase_id || null,
-      margin_pct: e.margin_pct ?? null, source_pdf_path: e.source_pdf_path ?? null }); // 036: 利益率・業者PDFを引き継ぐ
+      margin_pct: b.margin_pct ?? null, source_pdf_path: b.source_pdf_path ?? null }); // 036: 利益率・業者PDFを引き継ぐ（088: 元にする版から）
     db.estimates.push(row);
     Object.assign(e, { status: 'superseded', prev_status: e.status, updated_at: nowIso() }); // 057: 旧版にする前の状態
+    if (!owner) {
+      const nm = (memberOf(user.id) || {}).display_name || '作業担当者';
+      const no = e.number || '番号なし';
+      const title = phaseTitleOf(e.phase_id);
+      reeditMsg(e.case_id, e.phase_id, '見積書の新しい版を作りました（' + no + ' 第' + (e.version + 1) + '版）', caseLine(e.case_id) + '\n' + (title ? '対応: ' + title + '\n' : '')
+        + nm + 'が見積書（' + no + '）の第' + (e.version + 1) + '版を作りました（第' + b.version + '版を元に）\n提出されたら、内容を確かめてから依頼元へ送付してください。', user.id);
+    }
     return row.id;
   }
   // migration 009/010: 担当者URL（期限は null=期限なし、ありなら発行から90日以内: migration 012）
