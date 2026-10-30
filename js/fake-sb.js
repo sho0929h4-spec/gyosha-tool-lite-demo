@@ -131,6 +131,8 @@
 // migration 085（Task 68）: rpc doc_share_sent（管理者か、現場用で本人が登録した案件の本人。送付メールの下書き → 送信済み・報告書 → 送付済み・見積書 → 送付済み・
 //   紐付けた依頼を反映済み・タイムライン「302号室 調査報告書を共有した（LINE）」）・doc_share_undo（管理者だけ。下書きに戻す・ほかに送信済みが無ければ書類を戻す）
 // migration 087（Task 72）: doc_share_sent はその書類の対応（報告書・見積書の phase_id）の作業担当者も通す
+// migration 093（Task 79）: mail_drafts.notice_id（掲示を消すと null）・purpose 'notice'。doc_share_sent / doc_share_undo を工事掲示にも
+//   （状態は無い・号室は掲示の room → 案件・名前「工事掲示」）。書類は下書きと同じ案件のものだけ
 // migration 066（Task 47）: case_phases.lost_at / bill_requested_at（画面から書けない）・rpc phase_set_stage（管理者か、現場用で本人が登録した案件の本人。
 //   lost / active / wait / done / bill_requested / billed / paid。後ろの段の記録は消す・staff_messages source 'stage'（既読）・タイムライン）・
 //   phase_nudge は失注を拒否・phase_report_overdue は 'lost'。case_summaries の phases に lost_at / bill_requested_at、estimates に notes / line_texts
@@ -423,7 +425,7 @@ const sb = (() => {
       insert(r) {
         const row = { id: uuid(), org_id: ORG_ID, report_id: null, to_email: null, cc: null, subject: '',
           body: '', status: 'draft', pdf_path: null, created_by: user.id, created_at: nowIso(),
-          updated_at: nowIso(), sent_at: null, sent_by: null, phase_id: null, purpose: null, remind_slot: null,
+          updated_at: nowIso(), sent_at: null, sent_by: null, phase_id: null, notice_id: null, purpose: null, remind_slot: null,
           remind_for: null, skipped_at: null, recipients: [], ...r };
         if (!caseOf(row.case_id)) throw E.fk('mail_drafts', 'mail_drafts_case_id_org_id_fkey');
         phaseFk('mail_drafts', row);
@@ -433,6 +435,7 @@ const sb = (() => {
         mailPhaseChecks(row);
         if (row.report_id && !db.reports.some(x => x.id === row.report_id)) throw E.fk('mail_drafts', 'mail_drafts_report_id_org_id_fkey');
         if (row.estimate_id && !db.estimates.some(x => x.id === row.estimate_id)) throw E.fk('mail_drafts', 'mail_drafts_estimate_fk');
+        if (row.notice_id && !db.notices.some(x => x.id === row.notice_id)) throw E.fk('mail_drafts', 'mail_drafts_notice_fk');
         if (row.subject == null) throw E.notnull('mail_drafts', 'subject');
         if (row.body == null) throw E.notnull('mail_drafts', 'body');
         if (!['draft', 'sent'].includes(row.status)) throw E.check('mail_drafts', 'mail_drafts_status_check');
@@ -477,7 +480,8 @@ const sb = (() => {
     },
     validateUpdate(row) { noticeChecks(row); phaseFk('notices', row); },
     touch: true,
-    del: true
+    del: true,
+    afterDelete(row) { db.mail_drafts.forEach(d => { if (d.notice_id === row.id) d.notice_id = null; }); } // 093: on delete set null (notice_id)
   };
   // migration 014/015: 見積書（estimate_totals / estimates_guard / estimates_links_guard / RLS delete は draft のみ）
   const P = m => P0001(m);
@@ -754,7 +758,7 @@ const sb = (() => {
   function mailPhaseChecks(row) {
     // migration 023: survey_result（調査結果のご報告）を追加。日程連絡・リマインドと同じくフェーズに付く
     // migration 026: staff_notice（担当者への確認依頼・担当者向けの前日のお知らせ。remind_slot は d1 だけ）
-    if (row.purpose != null && !['report', 'estimate', 'schedule', 'reminder', 'survey_result', 'staff_notice'].includes(row.purpose)) throw E.check('mail_drafts', 'mail_drafts_purpose_check');
+    if (row.purpose != null && !['report', 'estimate', 'schedule', 'reminder', 'survey_result', 'staff_notice', 'notice'].includes(row.purpose)) throw E.check('mail_drafts', 'mail_drafts_purpose_check');
     if (['schedule', 'reminder', 'survey_result', 'staff_notice'].includes(row.purpose) && !row.phase_id) throw E.check('mail_drafts', 'mail_drafts_phase_purpose_check');
     if ((row.purpose === 'reminder' && row.remind_slot == null) || (row.remind_slot != null && !['reminder', 'staff_notice'].includes(row.purpose)) ||
       (row.purpose === 'staff_notice' && row.remind_slot != null && row.remind_slot !== 'd1')) throw E.check('mail_drafts', 'mail_drafts_reminder_slot_check');
@@ -2058,6 +2062,7 @@ const sb = (() => {
   const T68_KIND = { site_check: '現地確認', survey: '調査', cause: '原因元工事', repair: '復旧工事', other: 'その他' };
   const T68_WT = { investigate: 'survey', repair: 'cause', restore: 'repair' };
   function t68Label(d) {
+    if (!d.report_id && !d.estimate_id && d.notice_id) return '工事掲示';
     if (d.report_id) {
       const r = db.reports.find(x => x.id === d.report_id) || {};
       const p = db.case_phases.find(x => x.id === r.phase_id);
@@ -2069,39 +2074,41 @@ const sb = (() => {
   }
   function t68Room(d, c) {
     const r = d.report_id ? db.reports.find(x => x.id === d.report_id) : null;
-    const room = String((r && String(r.room || '').trim()) || c.room || '').trim();
+    const n = !r && d.notice_id ? db.notices.find(x => x.id === d.notice_id) : null;
+    const room = String((r && String(r.room || '').trim()) || (n && String(n.room || '').trim()) || c.room || '').trim();
     return room ? (/[0-9０-９A-Za-zＡ-Ｚａ-ｚ]$/.test(room) ? room + '号室' : room) + ' ' : '';
   }
   function docShareSent(a) {
     const via = { share: 'スマホの共有', mail: 'メール', line: 'LINE' }[a.p_via];
     if (!via) throw P0001('共有のしかたの指定が正しくありません');
     const d = db.mail_drafts.find(x => x.id === a.p_draft && x.org_id === ORG_ID);
-    if (!d || (!d.report_id && !d.estimate_id)) throw P0001('共有する書類が見つかりません');
+    if (!d || (!d.report_id && !d.estimate_id && !d.notice_id)) throw P0001('共有する書類が見つかりません');
     const c = caseOf(d.case_id);
     if (!c || c.deleted_at) throw P0001('この案件は削除されています');
     // migration 087（Task 72）: その書類の対応（報告書・見積書の phase_id）の作業担当者も
-    const doc = d.report_id ? db.reports.find(x => x.id === d.report_id) : db.estimates.find(x => x.id === d.estimate_id);
+    const doc = d.report_id ? db.reports.find(x => x.id === d.report_id) : d.estimate_id ? db.estimates.find(x => x.id === d.estimate_id)
+      : db.notices.find(x => x.id === d.notice_id);
     const ph = doc && doc.phase_id ? db.case_phases.find(p => p.id === doc.phase_id && p.case_id === c.id) : null;
     if (!(myRole() === 'owner' || fieldRegistered(c) || (ph && ph.worker_id === user.id)))
       throw pgErr('共有できるのは、管理者と、その対応の作業担当者と、現場用でこの案件を登録した人だけです', '42501');
     if (d.status !== 'draft') throw P0001('すでに送付済みです。開き直してください');
     const at = nowIso();
     if (d.report_id) {
-      const r = db.reports.find(x => x.id === d.report_id);
+      const r = db.reports.find(x => x.id === d.report_id && x.case_id === c.id);
       if (!r) throw P0001('報告書が見つかりません');
       if (r.work_type === 'site_check') throw P0001('現地確認の記録は共有できません');
       if (r.status === 'draft') throw P0001('報告書を提出してから共有してください');
       if (r.status === 'submitted') Object.assign(r, { confirmed_at: at, confirmed_by: user.id });
       if (r.status === 'submitted' || r.status === 'confirmed') Object.assign(r, { status: 'sent', sent_at: at, updated_at: at });
-    } else {
-      const e = db.estimates.find(x => x.id === d.estimate_id);
+    } else if (d.estimate_id) {
+      const e = db.estimates.find(x => x.id === d.estimate_id && x.case_id === c.id);
       if (!e) throw P0001('見積書が見つかりません');
       if (e.status === 'superseded') throw P0001('この版より新しい版があります。最新の版で共有してください');
       if (!['issued', 'sent', 'accepted'].includes(e.status)) throw P0001('見積書を提出してから共有してください');
       if (e.status !== 'accepted') Object.assign(e, { status: 'sent', sent_at: at, updated_at: at });
       db.timeline_entries.filter(t => t.case_id === e.case_id && t.type === 'request' && !t.resolved_at && (e.linked_request_ids || []).includes(t.id))
         .forEach(t => { t.resolved_at = at; });
-    }
+    } else if (!db.notices.some(x => x.id === d.notice_id && x.case_id === c.id)) throw P0001('工事掲示が見つかりません'); // 093: 状態は無い
     Object.assign(d, { status: 'sent', sent_at: at, sent_by: user.id, updated_at: at });
     db.timeline_entries.push({ id: uuid(), org_id: ORG_ID, case_id: c.id, type: 'system', attachments: [], audiences: [], resolved_at: null,
       body: t68Room(d, c) + t68Label(d) + 'を共有した（' + via + '）', created_by: null, created_at: nowIso() });
@@ -2110,7 +2117,7 @@ const sb = (() => {
   function docShareUndo(a) {
     if (myRole() !== 'owner') throw pgErr('「送っていない」に戻せるのは管理者だけです', '42501');
     const d = db.mail_drafts.find(x => x.id === a.p_draft && x.org_id === ORG_ID);
-    if (!d || (!d.report_id && !d.estimate_id)) throw P0001('共有の記録が見つかりません');
+    if (!d || (!d.report_id && !d.estimate_id && !d.notice_id)) throw P0001('共有の記録が見つかりません');
     if (d.status !== 'sent') throw P0001('まだ送付していません');
     const c = caseOf(d.case_id);
     if (!c || c.deleted_at) throw P0001('この案件は削除されています');
