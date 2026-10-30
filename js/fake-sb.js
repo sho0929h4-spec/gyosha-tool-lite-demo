@@ -147,6 +147,8 @@
 // migration 057（Task 35）: reports / estimates の reedit_count・reedit_at・reedit_by・reedit_by_name・reedit_mark（画面から書けない・insert は既定値）・
 //   estimates.prev_status（new_estimate_version が旧版にするとき入れる）。提出済みの報告書を下書きに戻す直接の更新は不可・見積も不可（今まで通り）。
 //   確認／送付（報告書）・送付／承諾（見積）で印を消す。再編集で戻した下書き（報告書 reedit_count > 0・見積 番号あり）は削除できない。
+//   migration 090（Task 76）: reports.pdf_company（既定 true・画面から直接は変えられない）・rpc report_set_pdf_company。再編集のあとの再提出は
+//     次の対応を決めていなければ決めたときに「報告書を再提出しました（調査[・見積書提案期日 M/D]）」の1通（調査報告を再提出しました は出さない）
 //   migration 089（Task 75）: rpc report_decide_next（次の対応を1回だけ決める）・case_summaries の reports に next_pending・不明の検査は方針があるときだけ
 //   rpc report_reedit / estimate_reedit（作業担当者・提出した人・作った人・管理者）・cancel_estimate_version（管理者だけ）・
 //   share_state / share_reedit（担当者URL。anon も）。再編集・再提出は staff_messages（source reedit・宛先なし）とタイムライン。
@@ -379,7 +381,7 @@ const sb = (() => {
           work_date: null, time_start: null, time_end: null, worker_id: null, worker_name: null,
           data: {}, photos: [], created_by: user.id, created_at: nowIso(), updated_at: nowIso(),
           submitted_at: null, submitted_by: null, submitted_via: null, confirmed_at: null, confirmed_by: null,
-          sent_at: null, phase_id: null, ...r,
+          sent_at: null, phase_id: null, pdf_company: true, ...r, // 090: pdf_company（既定 true）
           reedit_count: 0, reedit_at: null, reedit_by: null, reedit_by_name: null, reedit_mark: false }; // 057: 画面から入れても既定値
         reportChecks(row);
         if (!caseOf(row.case_id)) throw E.fk('reports', 'reports_case_id_org_id_fkey');
@@ -389,6 +391,8 @@ const sb = (() => {
       validateUpdate(row, old) {
         // migration 044: 入力中ロック（011 reports_share_lock）は廃止。URL が使えても社内は更新できる（あとから保存した内容が残る）
         reportChecks(row);
+        // migration 090: pdf_company は列 grant なし（report_set_pdf_company だけが変える）
+        if (old && row.pdf_company !== old.pdf_company) throw pgErr('permission denied for table reports', '42501');
         // migration 057 reports_status_guard: 提出済み以降 → 下書きは再編集の関数だけ。確認・送付で印を消す
         if (old && old.status !== 'draft' && row.status === 'draft') throw pgErr('提出済みの報告書は「再編集」からだけ下書きに戻せます', '42501');
         if (old && row.status !== old.status && ['confirmed', 'sent'].includes(row.status)) row.reedit_mark = false;
@@ -1209,10 +1213,13 @@ const sb = (() => {
     const body = ['次の対応方針: ' + (n.type === 'cause' ? '原因元工事' : '再調査'), '見積書提案期日: ' + mdW(n.estimateDue) + why,
       '提出: ' + who + (r.submitted_via === 'share' ? '（担当者URL）' : '')]
       .concat(n.type === 'resurvey' ? ['再調査の理由: ' + String(n.reason || '').trim(), '再調査の内容: ' + String(n.detail || '').trim()] : [])
-      .join('\n') + (rooms ? '\n\n■ 号室ごとの原因\n' + rooms : '');
-    db.staff_messages.push({ id: uuid(), org_id: r.org_id, case_id: r.case_id, phase_id: r.phase_id || null, from_user: signedIn ? user.id : null,
-      to_user: null, subject: '調査報告を' + (r.reedit_count > 0 ? '再提出' : '提出') + 'しました（見積書提案期日 ' + md + '）', body: Array.from(body).slice(0, 4000).join(''), attachments: [],
-      read_at: null, reply_to: null, created_at: nowIso(), source: r.reedit_count > 0 ? 'reedit' : 'report_submit' }); // 057: 再提出
+      .join('\n');
+    const tail = rooms ? '\n\n■ 号室ごとの原因\n' + rooms : '';
+    // migration 090: 再編集のあとの再提出は「報告書を再提出しました（調査・見積書提案期日 M/D）」の1通（reportReeditAfter は送らない）
+    if (r.reedit_count > 0) reportReeditMsg(r, '見積書提案期日 ' + md, body, tail, signedIn ? user.id : null);
+    else db.staff_messages.push({ id: uuid(), org_id: r.org_id, case_id: r.case_id, phase_id: r.phase_id || null, from_user: signedIn ? user.id : null,
+      to_user: null, subject: '調査報告を提出しました（見積書提案期日 ' + md + '）', body: Array.from(body + tail).slice(0, 4000).join(''), attachments: [],
+      read_at: null, reply_to: null, created_at: nowIso(), source: 'report_submit' });
     return target.id; // 089: _report_next_apply は期日を入れたフェーズを返す
   }
   // migration 089 report_decide_next: 提出済みの調査の報告書の次の対応を1回だけ決める（report_reedit と同じ人だけ）
@@ -1236,6 +1243,7 @@ const sb = (() => {
       if (pn[k] != null && typeof pn[k] !== 'string') throw P0001('送信内容が不正です');
       n[k] = pn[k] == null ? '' : pn[k];
     }
+    const pending = !!(r.data && r.data.nextPending === true); // 090: 提出のときに再提出の連絡を送っていない
     const data = Object.assign({}, isPlainObj(r.data) ? r.data : {}, { nextAction: n });
     delete data.nextPending;
     const err = reportDataCheck(data, r.work_type);
@@ -1244,8 +1252,22 @@ const sb = (() => {
     r.data = data;
     let phaseId;
     try { phaseId = reportNextAction(r); } catch (e) { r.data = keep; throw e; }
+    if (type === 'other' && pending && r.reedit_count > 0) reportReeditMsg(r, '', '', '', user.id); // 090: その他に決めたときも再提出の連絡は1通
     r.updated_at = nowIso();
     return { ok: true, type, phase_id: phaseId || null };
+  }
+  // migration 090 report_set_pdf_company: 報告書の PDF に会社名とロゴを出すか（共有できる人と同じ。提出済み・送付済みでも）
+  function reportSetPdfCompany(args) {
+    if (typeof (args && args.p_show) !== 'boolean') throw P0001('送信内容が不正です');
+    const r = db.reports.find(x => x.id === args.p_id && x.org_id === ORG_ID);
+    if (!r) throw P0001('報告書が見つかりません');
+    const c = caseOf(r.case_id);
+    if (!c || c.deleted_at) throw P0001('この案件は削除されています');
+    const ph = r.phase_id ? db.case_phases.find(p => p.id === r.phase_id && p.case_id === c.id) : null;
+    if (!(myRole() === 'owner' || fieldRegistered(c) || (ph && ph.worker_id === user.id)))
+      throw pgErr('会社名とロゴの設定を変えられるのは、管理者と、その対応の作業担当者と、現場用でこの案件を登録した人だけです', '42501');
+    if (r.pdf_company !== args.p_show) { r.pdf_company = args.p_show; r.updated_at = nowIso(); }
+    return { ok: true, pdf_company: args.p_show };
   }
   // migration 047 の補助関数と同じ文
   const CAUSE_DEFS = [['tenant', '入居者やらかし', 'tenant'], ['hot_pipe', '給湯管', ''], ['water_pipe', '給水管', ''], ['washer', '洗濯機', 'detail'],
@@ -2665,13 +2687,20 @@ const sb = (() => {
     if (r.work_type === 'site_check') return; // 083: reportSiteCheckSent が「再送信しました」
     const n = r.data && r.data.nextAction;
     if (r.work_type === 'investigate' && n && typeof n === 'object' && ['cause', 'resurvey'].includes(n.type)) return; // reports_next_action が送る
+    // migration 090: 次の対応をまだ決めていない調査の報告書は、決めたとき（report_decide_next）に1通だけ送る
+    if (r.work_type === 'investigate' && r.data && r.data.nextPending === true && !(n && n.type)) return;
+    reportReeditMsg(r, '', '', '', r.submitted_via === 'share' ? null : (signedIn ? user.id : null));
+  }
+  // migration 090 _report_reedit_msg: 「報告書を再提出しました（調査[・見積書提案期日 M/D]）」。from は auth.uid()（担当者URLなら空）
+  function reportReeditMsg(r, sub, body, tail, from) {
     const title = phaseTitleOf(r.phase_id);
     const nm = v => (v == null || !String(v).trim() ? null : String(v).trim());
     const who = nm(r.worker_name) || (r.worker_id && memberOf(r.worker_id) ? nm(memberOf(r.worker_id).display_name) : null)
       || (r.submitted_by && memberOf(r.submitted_by) ? nm(memberOf(r.submitted_by).display_name) : null) || '作業担当者';
-    reeditMsg(r.case_id, r.phase_id, '報告書を再提出しました' + (title ? '（' + title + '）' : ''),
-      caseLine(r.case_id) + '\n' + (title ? '対応: ' + title + '\n' : '') + '提出: ' + who + (r.submitted_via === 'share' ? '（担当者URL）' : '')
-      + '\n再編集 ' + r.reedit_count + '回目のあとの提出です。内容を確かめてください。', r.submitted_via === 'share' ? null : (signedIn ? user.id : null));
+    const s = [title, sub].filter(Boolean).join('・');
+    reeditMsg(r.case_id, r.phase_id, '報告書を再提出しました' + (s ? '（' + s + '）' : ''),
+      caseLine(r.case_id) + '\n' + (title ? '対応: ' + title + '\n' : '') + (body || '提出: ' + who + (r.submitted_via === 'share' ? '（担当者URL）' : ''))
+      + '\n再編集 ' + r.reedit_count + '回目のあとの提出です。内容を確かめてください。' + (tail || ''), from);
   }
   const estNo = e => (e.number || '番号なし') + (e.version >= 2 ? '-v' + e.version : '');
   function estimateReeditAfter(e) {
@@ -2890,7 +2919,7 @@ const sb = (() => {
     }
     // migration 057（Task 35）
     const T35 = { report_reedit: reportReedit, estimate_reedit: estimateReedit, cancel_estimate_version: cancelEstimateVersion,
-      report_decide_next: reportDecideNext }; // 089
+      report_decide_next: reportDecideNext, report_set_pdf_company: reportSetPdfCompany }; // 089・090
     if (T35[name]) {
       try { return { data: T35[name](args || {}), error: null }; }
       catch (e) { if (e && e.message !== undefined && !(e instanceof Error)) return { data: null, error: e }; throw e; }
