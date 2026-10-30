@@ -147,6 +147,8 @@
 // migration 057（Task 35）: reports / estimates の reedit_count・reedit_at・reedit_by・reedit_by_name・reedit_mark（画面から書けない・insert は既定値）・
 //   estimates.prev_status（new_estimate_version が旧版にするとき入れる）。提出済みの報告書を下書きに戻す直接の更新は不可・見積も不可（今まで通り）。
 //   確認／送付（報告書）・送付／承諾（見積）で印を消す。再編集で戻した下書き（報告書 reedit_count > 0・見積 番号あり）は削除できない。
+//   migration 092（Task 78）: estimate_templates（見積書のテンプレート。持ち主の決まりは 068 と同じ・insert は owner_user_id / name / lines / sort・
+//     update は name / sort だけ・lines は 1〜30行の形の check・delete 可）
 //   migration 091（Task 77）: work_logs（現地の着・出と報告書・見積書を書いていた分。本人だけ書ける・本人と管理者が読める・消せない・列 grant・形の check）
 //   migration 090（Task 76）: reports.pdf_company（既定 true・画面から直接は変えられない）・rpc report_set_pdf_company。再編集のあとの再提出は
 //     次の対応を決めていなければ決めたときに「報告書を再提出しました（調査[・見積書提案期日 M/D]）」の1通（調査報告を再提出しました は出さない）
@@ -217,7 +219,8 @@ const sb = (() => {
     phase_schedules: [], // migration 069: 日程調整（読むだけ。書くのは rpc phase_sched_* と case_phases の日時のトリガー）
     open_call_apps: [], // migration 070: 一斉配信の「行けます」の記録（読むだけ。書くのは rpc phase_open_call_accept）
     purge_files: [], // migration 078: 完全に消した案件のファイルの一覧（管理者だけ読める。書くのは DB の毎日の削除と rpc purge_files_done）
-    work_logs: [] // migration 091: 日報に自動で入れる作業の記録（本人だけ書ける・本人と管理者が読める・消せない）
+    work_logs: [], // migration 091: 日報に自動で入れる作業の記録（本人だけ書ける・本人と管理者が読める・消せない）
+    estimate_templates: [] // migration 092: 見積書のテンプレート（自分専用／会社共通）
   };
 
   // ---- シード ----
@@ -305,6 +308,7 @@ const sb = (() => {
     case_rooms: ['role', 'room', 'resident_name', 'email', 'tel', 'note', 'sort'], // migration 030: 列 grant（case_id は変えられない）
     staff_messages: ['read_at'], // migration 041: 既読だけ
     work_logs: ['arrived_at', 'left_at', 'minutes'], // migration 091: 着・出・分だけ
+    estimate_templates: ['name', 'sort'], // migration 092: 名前と並びだけ（中身の行は変えない）
     memberships: ['display_name', 'phone', 'survey_end_mins'] // migration 056: 本人の担当者名・電話番号・086: 調査の終了予定の既定
   };
 
@@ -938,6 +942,45 @@ const sb = (() => {
     validateUpdate(row) { presetChecks(row); },
     canSelect: r => !r.owner_user_id || presetMine(r), // 068: 自分専用は本人だけ
     canUpdate: presetWritable, // 042 / 068: 見えない・書けない行は 0 行
+    canDelete: presetWritable,
+    touch: true,
+    del: true
+  };
+
+  // migration 092（Task 78）: 見積書のテンプレート。持ち主の決まりは 068（presetWritable / presetMine）と同じ
+  const TPL_COLS = ['owner_user_id', 'name', 'lines', 'sort'];
+  function templateChecks(row) {
+    const ck = c => E.check('estimate_templates', 'estimate_templates_' + c + '_check');
+    const len = v => Array.from(String(v)).length;
+    const name = String(row.name == null ? '' : row.name);
+    if (len(name) > 40 || !name.trim()) throw ck('name');
+    if (!Number.isInteger(row.sort) || row.sort < 0 || row.sort > 1000000) throw ck('sort');
+    const ls = row.lines;
+    if (ls == null) throw E.notnull('estimate_templates', 'lines');
+    const isNum = v => typeof v === 'number' && Number.isFinite(v);
+    const bytes = v => new TextEncoder().encode(JSON.stringify(v)).length;
+    const ok = Array.isArray(ls) && ls.length >= 1 && ls.length <= 30 && bytes(ls) <= 75000 && ls.every(l =>
+      l && typeof l === 'object' && !Array.isArray(l) && bytes(l) <= 2500 &&
+      Object.keys(l).every(k => ['description', 'detail', 'quantity', 'unit', 'amount'].includes(k)) &&
+      typeof l.description === 'string' && len(l.description) <= 200 &&
+      (!('detail' in l) || (typeof l.detail === 'string' && len(l.detail) <= 500)) &&
+      typeof l.unit === 'string' && len(l.unit) <= 10 &&
+      isNum(l.quantity) && l.quantity >= 0 && l.quantity <= 1000000 &&
+      isNum(l.amount) && Number.isInteger(l.amount) && Math.abs(l.amount) <= 1e12 &&
+      !(!l.description.trim() && !String(l.detail || '').trim() && l.amount === 0)); // 空の行は入れない
+    if (!ok) throw ck('lines');
+  }
+  T.estimate_templates = {
+    insert(r) {
+      if (Object.keys(r).some(k => !TPL_COLS.includes(k))) throw E.denied('estimate_templates');
+      const row = { id: uuid(), org_id: ORG_ID, sort: 0, owner_user_id: null, created_by: user.id, created_at: nowIso(), updated_at: nowIso(), ...clone(r) };
+      if (!presetWritable(row)) throw E.rls('estimate_templates');
+      templateChecks(row);
+      return row;
+    },
+    validateUpdate(row) { templateChecks(row); },
+    canSelect: r => !r.owner_user_id || presetMine(r),
+    canUpdate: presetWritable,
     canDelete: presetWritable,
     touch: true,
     del: true
