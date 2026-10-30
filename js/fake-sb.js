@@ -147,6 +147,7 @@
 // migration 057（Task 35）: reports / estimates の reedit_count・reedit_at・reedit_by・reedit_by_name・reedit_mark（画面から書けない・insert は既定値）・
 //   estimates.prev_status（new_estimate_version が旧版にするとき入れる）。提出済みの報告書を下書きに戻す直接の更新は不可・見積も不可（今まで通り）。
 //   確認／送付（報告書）・送付／承諾（見積）で印を消す。再編集で戻した下書き（報告書 reedit_count > 0・見積 番号あり）は削除できない。
+//   migration 091（Task 77）: work_logs（現地の着・出と報告書・見積書を書いていた分。本人だけ書ける・本人と管理者が読める・消せない・列 grant・形の check）
 //   migration 090（Task 76）: reports.pdf_company（既定 true・画面から直接は変えられない）・rpc report_set_pdf_company。再編集のあとの再提出は
 //     次の対応を決めていなければ決めたときに「報告書を再提出しました（調査[・見積書提案期日 M/D]）」の1通（調査報告を再提出しました は出さない）
 //   migration 089（Task 75）: rpc report_decide_next（次の対応を1回だけ決める）・case_summaries の reports に next_pending・不明の検査は方針があるときだけ
@@ -215,7 +216,8 @@ const sb = (() => {
     calendar_feeds: [], // migration 077: Google カレンダーの購読トークン（本物は画面から読めない。rpc cal_feed_token / cal_feed_events だけが使う）
     phase_schedules: [], // migration 069: 日程調整（読むだけ。書くのは rpc phase_sched_* と case_phases の日時のトリガー）
     open_call_apps: [], // migration 070: 一斉配信の「行けます」の記録（読むだけ。書くのは rpc phase_open_call_accept）
-    purge_files: [] // migration 078: 完全に消した案件のファイルの一覧（管理者だけ読める。書くのは DB の毎日の削除と rpc purge_files_done）
+    purge_files: [], // migration 078: 完全に消した案件のファイルの一覧（管理者だけ読める。書くのは DB の毎日の削除と rpc purge_files_done）
+    work_logs: [] // migration 091: 日報に自動で入れる作業の記録（本人だけ書ける・本人と管理者が読める・消せない）
   };
 
   // ---- シード ----
@@ -302,6 +304,7 @@ const sb = (() => {
     estimate_presets: ['kind', 'label', 'line', 'sort'], // migration 029: 列 grant
     case_rooms: ['role', 'room', 'resident_name', 'email', 'tel', 'note', 'sort'], // migration 030: 列 grant（case_id は変えられない）
     staff_messages: ['read_at'], // migration 041: 既読だけ
+    work_logs: ['arrived_at', 'left_at', 'minutes'], // migration 091: 着・出・分だけ
     memberships: ['display_name', 'phone', 'survey_end_mins'] // migration 056: 本人の担当者名・電話番号・086: 調査の終了予定の既定
   };
 
@@ -1062,6 +1065,39 @@ const sb = (() => {
   T.talk_reads = { canSelect: r => r.user_id === user.id, del: false }; // 065: 自分の分だけ読める（insert / update は無い）
   T.phase_schedules = { insert() { throw E.denied('phase_schedules'); }, update: false, del: false }; // 069: 読むだけ
   T.open_call_apps = { insert() { throw E.denied('open_call_apps'); }, update: false, del: false }; // 070: 読むだけ
+  // migration 091（Task 77）: work_logs。insert は列 grant（user_id・org_id は既定値＝本人・自分の会社）・見える案件だけ・
+  //   形の check（site: 対応と着いた時刻・出たは着いたより後・分は0／report・estimate: 書類だけ）・分は 0〜1440・同じ日の同じ書類は1行
+  const WL_INSERT_COLS = ['ymd', 'kind', 'case_id', 'phase_id', 'report_id', 'estimate_id', 'arrived_at', 'left_at', 'minutes'];
+  function workLogChecks(r) {
+    const n = v => (v == null ? null : new Date(v).getTime());
+    const shape = r.kind === 'site'
+      ? !!r.phase_id && !r.report_id && !r.estimate_id && !!r.arrived_at && r.minutes === 0 && (r.left_at == null || n(r.left_at) >= n(r.arrived_at))
+      : r.kind === 'report' ? !!r.report_id && !r.estimate_id && r.arrived_at == null && r.left_at == null
+      : r.kind === 'estimate' ? !!r.estimate_id && !r.report_id && r.arrived_at == null && r.left_at == null : false;
+    if (!['site', 'report', 'estimate'].includes(r.kind)) throw E.check('work_logs', 'work_logs_kind_check');
+    if (!Number.isInteger(r.minutes) || r.minutes < 0 || r.minutes > 1440) throw E.check('work_logs', 'work_logs_minutes_check');
+    if (!shape) throw E.check('work_logs', 'work_logs_shape_check');
+  }
+  T.work_logs = {
+    insert(r) {
+      if (Object.keys(r).some(k => !WL_INSERT_COLS.includes(k))) throw E.denied('work_logs');
+      const row = { id: uuid(), org_id: ORG_ID, user_id: user.id, phase_id: null, report_id: null, estimate_id: null, arrived_at: null, left_at: null,
+        minutes: 0, created_at: nowIso(), updated_at: nowIso(), ...clone(r) };
+      if (!row.ymd) throw E.notnull('work_logs', 'ymd');
+      if (!caseOf(row.case_id)) throw E.fk('work_logs', 'work_logs_case_id_org_id_fkey');
+      if (!caseVisible(row.case_id)) throw E.rls('work_logs');
+      workLogChecks(row);
+      const dup = row.kind !== 'site' && db.work_logs.some(x => x.user_id === row.user_id && x.ymd === row.ymd && x.kind === row.kind
+        && (row.kind === 'report' ? x.report_id === row.report_id : x.estimate_id === row.estimate_id));
+      if (dup) throw pgErr(`duplicate key value violates unique constraint "work_logs_${row.kind}_uniq"`, '23505');
+      return row;
+    },
+    validateUpdate(row) { workLogChecks(row); },
+    canSelect: r => r.user_id === user.id || myRole() === 'owner',
+    canUpdate: r => r.user_id === user.id,
+    touch: true,
+    del: false
+  };
   T.purge_files = { insert() { throw E.denied('purge_files'); }, update: false, del: false, canSelect: () => myRole() === 'owner' }; // 078: 管理者だけ読む
   // migration 069: 日時の欄で直接入れた → 確定、消した → 未定（case_phases_sched_sync）
   function schedSync(row, old) {
