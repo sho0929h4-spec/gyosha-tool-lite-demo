@@ -147,6 +147,7 @@
 // migration 057（Task 35）: reports / estimates の reedit_count・reedit_at・reedit_by・reedit_by_name・reedit_mark（画面から書けない・insert は既定値）・
 //   estimates.prev_status（new_estimate_version が旧版にするとき入れる）。提出済みの報告書を下書きに戻す直接の更新は不可・見積も不可（今まで通り）。
 //   確認／送付（報告書）・送付／承諾（見積）で印を消す。再編集で戻した下書き（報告書 reedit_count > 0・見積 番号あり）は削除できない。
+//   migration 089（Task 75）: rpc report_decide_next（次の対応を1回だけ決める）・case_summaries の reports に next_pending・不明の検査は方針があるときだけ
 //   rpc report_reedit / estimate_reedit（作業担当者・提出した人・作った人・管理者）・cancel_estimate_version（管理者だけ）・
 //   share_state / share_reedit（担当者URL。anon も）。再編集・再提出は staff_messages（source reedit・宛先なし）とタイムライン。
 //   share_open の report.photos・reedit_count、share_submit は報告書に入っている写真をそのまま出し直せる（使用量は数え直さない）。
@@ -1099,8 +1100,9 @@ const sb = (() => {
       if (p.causes.some(x => !isObj(x) || !CAUSE_KEYS.includes(x.key) || !strOrNull(x.detail) || len(x.detail) > 200)) return bad;
     }
     // migration 064 → 074: 原因が「不明」なら次の対応方針は「再調査」か「その他」（その他は内容が必須。調査のとき）
-    if (workType === 'investigate' && Array.isArray(p.causes) && p.causes.some(x => x.key === 'unknown')) {
-      const nt = isObj(p.nextAction) ? p.nextAction.type : '';
+    // migration 089: 方針がまだ空（提出したあと決める）ときは見ない
+    if (workType === 'investigate' && Array.isArray(p.causes) && p.causes.some(x => x.key === 'unknown') && isObj(p.nextAction) && p.nextAction.type) {
+      const nt = p.nextAction.type;
       if (nt !== 'resurvey' && nt !== 'other') return '原因が「不明」のときは、次の対応方針を「再調査」か「その他」にしてください';
       if (nt === 'other' && blank(p.nextAction.other)) return '「その他」の内容を入れてください';
     }
@@ -1137,7 +1139,7 @@ const sb = (() => {
         .forEach(x => { x.estimate_due = null; x.estimate_due_reason = null; x.estimate_due_by = null; x.updated_at = nowIso(); });
     }
     const n = r.data && r.data.nextAction;
-    if (!n || typeof n !== 'object' || !['cause', 'resurvey'].includes(n.type)) return;
+    if (!n || typeof n !== 'object' || !['cause', 'resurvey'].includes(n.type)) return null;
     const name = v => (v == null || !String(v).trim() ? null : String(v).trim());
     const who = name(r.worker_name) || (r.worker_id && memberOf(r.worker_id) ? name(memberOf(r.worker_id).display_name) : null)
       || (r.submitted_by && memberOf(r.submitted_by) ? name(memberOf(r.submitted_by).display_name) : null) || '作業担当者'; // 040: 名前が無いときの呼び名
@@ -1211,6 +1213,39 @@ const sb = (() => {
     db.staff_messages.push({ id: uuid(), org_id: r.org_id, case_id: r.case_id, phase_id: r.phase_id || null, from_user: signedIn ? user.id : null,
       to_user: null, subject: '調査報告を' + (r.reedit_count > 0 ? '再提出' : '提出') + 'しました（見積書提案期日 ' + md + '）', body: Array.from(body).slice(0, 4000).join(''), attachments: [],
       read_at: null, reply_to: null, created_at: nowIso(), source: r.reedit_count > 0 ? 'reedit' : 'report_submit' }); // 057: 再提出
+    return target.id; // 089: _report_next_apply は期日を入れたフェーズを返す
+  }
+  // migration 089 report_decide_next: 提出済みの調査の報告書の次の対応を1回だけ決める（report_reedit と同じ人だけ）
+  function isPlainObj(v) { return !!v && typeof v === 'object' && !Array.isArray(v); }
+  function reportDecideNext(args) {
+    const r = db.reports.find(x => x.id === (args && args.p_id) && x.org_id === ORG_ID);
+    if (!r) throw P0001('報告書が見つかりません');
+    const ph = r.phase_id ? db.case_phases.find(x => x.id === r.phase_id) : null;
+    if (!(myRole() === 'owner' || user.id === r.submitted_by || user.id === r.worker_id || (ph && user.id === ph.worker_id))) {
+      throw pgErr('この報告書の次の対応を決められるのは、作業担当者と管理者だけです', '42501');
+    }
+    if (r.work_type !== 'investigate') throw P0001('調査の報告書ではありません');
+    if (r.status === 'draft') throw P0001('この報告書はまだ提出されていません');
+    if (r.data && isPlainObj(r.data.nextAction) && r.data.nextAction.type) throw P0001('次の対応はもう決まっています');
+    const pn = args.p_next;
+    if (!isPlainObj(pn)) throw P0001('送信内容が不正です');
+    const type = pn.type || '';
+    if (!['cause', 'resurvey', 'other'].includes(type)) throw P0001('次の対応を1つ選んでください');
+    const n = { type };
+    for (const k of ['estimateDue', 'reason', 'detail', 'other', 'estimateDueReason', 'estimateDueBy']) {
+      if (pn[k] != null && typeof pn[k] !== 'string') throw P0001('送信内容が不正です');
+      n[k] = pn[k] == null ? '' : pn[k];
+    }
+    const data = Object.assign({}, isPlainObj(r.data) ? r.data : {}, { nextAction: n });
+    delete data.nextPending;
+    const err = reportDataCheck(data, r.work_type);
+    if (err) throw P0001(err);
+    const keep = r.data;
+    r.data = data;
+    let phaseId;
+    try { phaseId = reportNextAction(r); } catch (e) { r.data = keep; throw e; }
+    r.updated_at = nowIso();
+    return { ok: true, type, phase_id: phaseId || null };
   }
   // migration 047 の補助関数と同じ文
   const CAUSE_DEFS = [['tenant', '入居者やらかし', 'tenant'], ['hot_pipe', '給湯管', ''], ['water_pipe', '給水管', ''], ['washer', '洗濯機', 'detail'],
@@ -1300,6 +1335,8 @@ const sb = (() => {
           submitted_by: r.submitted_by || null, // 045: 提出した人
           work_date: r.work_date || null, time_end: r.time_end || null, // 053: 報告書の期限
           reedit_mark: !!r.reedit_mark, reedit_at: r.reedit_at || null, reedit_by_name: r.reedit_by_name || null, reedit_count: r.reedit_count || 0, // 057
+          next_pending: r.work_type === 'investigate' && r.status !== 'draft' && !!r.data && r.data.nextPending === true
+            && !(isPlainObj(r.data.nextAction) && r.data.nextAction.type), // 089
           share_active: db.report_shares.some(sh => sh.report_id === r.id && shareLive(sh)) }));
       const v = n => (n === undefined ? null : n);
       return { id: p.id, kind: p.kind, seq: seqOf[p.kind], label: v(p.label), source_phase_id: v(p.source_phase_id), // 058
@@ -2852,7 +2889,8 @@ const sb = (() => {
       catch (e) { if (e && e.message !== undefined && !(e instanceof Error)) return { data: null, error: e }; throw e; }
     }
     // migration 057（Task 35）
-    const T35 = { report_reedit: reportReedit, estimate_reedit: estimateReedit, cancel_estimate_version: cancelEstimateVersion };
+    const T35 = { report_reedit: reportReedit, estimate_reedit: estimateReedit, cancel_estimate_version: cancelEstimateVersion,
+      report_decide_next: reportDecideNext }; // 089
     if (T35[name]) {
       try { return { data: T35[name](args || {}), error: null }; }
       catch (e) { if (e && e.message !== undefined && !(e instanceof Error)) return { data: null, error: e }; throw e; }
