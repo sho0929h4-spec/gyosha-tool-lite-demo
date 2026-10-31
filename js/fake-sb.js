@@ -133,6 +133,8 @@
 // migration 087（Task 72）: doc_share_sent はその書類の対応（報告書・見積書の phase_id）の作業担当者も通す
 // migration 093（Task 79）: mail_drafts.notice_id（掲示を消すと null）・purpose 'notice'。doc_share_sent / doc_share_undo を工事掲示にも
 //   （状態は無い・号室は掲示の room → 案件・名前「工事掲示」）。書類は下書きと同じ案件のものだけ
+// migration 094（Task 80）: notices.issued_at（最初に共有かダウンロードをした時刻。insert では null・一度入ったら変えない・
+//   時刻はサーバー・issued_at だけの update では updated_at を動かさない）。doc_share_sent の工事掲示で入れる（undo では戻さない）
 // migration 066（Task 47）: case_phases.lost_at / bill_requested_at（画面から書けない）・rpc phase_set_stage（管理者か、現場用で本人が登録した案件の本人。
 //   lost / active / wait / done / bill_requested / billed / paid。後ろの段の記録は消す・staff_messages source 'stage'（既読）・タイムライン）・
 //   phase_nudge は失注を拒否・phase_report_overdue は 'lost'。case_summaries の phases に lost_at / bill_requested_at、estimates に notes / line_texts
@@ -293,7 +295,7 @@ const sb = (() => {
     mail_drafts: ['to_email', 'cc', 'subject', 'body', 'status', 'pdf_path', 'sent_at', 'sent_by', 'recipients', 'skipped_at'],
     report_shares: ['revoked_at'],
     // migration 013: 工事掲示は一覧用の列と data だけ更新できる（org_id / case_id / created_* は変更不可）
-    notices: ['room', 'work_name', 'work_date', 'work_date_end', 'work_date_tbd', 'data', 'phase_id'],
+    notices: ['room', 'work_name', 'work_date', 'work_date_end', 'work_date_tbd', 'data', 'phase_id', 'issued_at'], // 094: issued_at
     // migration 014: number・series_id・version・所属は更新不可（number は issue_estimate だけが付ける）
     estimates: ['status', 'data', 'lines', 'subtotal', 'tax', 'total', 'linked_request_ids', 'issued_at', 'sent_at', 'accepted_at', 'phase_id',
       'margin_pct', 'source_pdf_path'], // migration 036: 利益率・読み込んだ業者PDF
@@ -454,7 +456,7 @@ const sb = (() => {
   };
   // migration 013: 工事掲示（案件の子。複合FK、data は object、RLS = 自社のみ。delete は自社なら可）
   const NOTICE_COLS_ALL = ['id', 'org_id', 'case_id', 'room', 'work_name', 'work_date', 'work_date_end', 'work_date_tbd',
-    'data', 'created_by', 'created_at', 'updated_at', 'phase_id'];
+    'data', 'created_by', 'created_at', 'updated_at', 'phase_id', 'issued_at'];
   const isDateStr = v => v === null || (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) && !isNaN(Date.parse(v)));
   function noticeChecks(row) {
     if (!row.data || typeof row.data !== 'object' || Array.isArray(row.data)) throw E.check('notices', 'notices_data_check');
@@ -472,14 +474,21 @@ const sb = (() => {
       if (bad.length) throw pgErr(`Could not find the '${bad[0]}' column of 'notices' in the schema cache`, 'PGRST204');
       if (r.org_id && r.org_id !== ORG_ID) throw E.rls('notices'); // notices_insert: org_id = my_org_id()
       const row = { id: uuid(), org_id: ORG_ID, room: null, work_name: null, work_date: null, work_date_end: null,
-        work_date_tbd: false, data: {}, created_by: user.id, created_at: nowIso(), updated_at: nowIso(), phase_id: null, ...r };
+        work_date_tbd: false, data: {}, created_by: user.id, created_at: nowIso(), updated_at: nowIso(), phase_id: null, ...r, issued_at: null }; // 094: insert では null
       if (!caseOf(row.case_id)) throw E.fk('notices', 'notices_case_id_org_id_fkey');
       noticeChecks(row);
       phaseFk('notices', row);
       return row;
     },
-    validateUpdate(row) { noticeChecks(row); phaseFk('notices', row); },
+    validateUpdate(row, old) {
+      noticeChecks(row); phaseFk('notices', row);
+      if (row.issued_at !== old.issued_at) row.issued_at = old.issued_at || nowIso(); // 094: 時刻はサーバー・一度入ったら変えない
+    },
     touch: true,
+    afterUpdate(row, old) { // 094: issued_at だけの update では updated_at を動かさない
+      const rest = o => JSON.stringify({ ...o, issued_at: 0, updated_at: 0 });
+      if (rest(row) === rest(old)) row.updated_at = old.updated_at;
+    },
     del: true,
     afterDelete(row) { db.mail_drafts.forEach(d => { if (d.notice_id === row.id) d.notice_id = null; }); } // 093: on delete set null (notice_id)
   };
@@ -2108,7 +2117,11 @@ const sb = (() => {
       if (e.status !== 'accepted') Object.assign(e, { status: 'sent', sent_at: at, updated_at: at });
       db.timeline_entries.filter(t => t.case_id === e.case_id && t.type === 'request' && !t.resolved_at && (e.linked_request_ids || []).includes(t.id))
         .forEach(t => { t.resolved_at = at; });
-    } else if (!db.notices.some(x => x.id === d.notice_id && x.case_id === c.id)) throw P0001('工事掲示が見つかりません'); // 093: 状態は無い
+    } else {
+      const n = db.notices.find(x => x.id === d.notice_id && x.case_id === c.id);
+      if (!n) throw P0001('工事掲示が見つかりません'); // 093: 状態は無い
+      n.issued_at = n.issued_at || at; // 094: 最初に出した時刻
+    }
     Object.assign(d, { status: 'sent', sent_at: at, sent_by: user.id, updated_at: at });
     db.timeline_entries.push({ id: uuid(), org_id: ORG_ID, case_id: c.id, type: 'system', attachments: [], audiences: [], resolved_at: null,
       body: t68Room(d, c) + t68Label(d) + 'を共有した（' + via + '）', created_by: null, created_at: nowIso() });
