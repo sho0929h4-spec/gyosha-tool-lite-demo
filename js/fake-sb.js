@@ -154,10 +154,12 @@
 //   migration 092（Task 78）: estimate_templates（見積書のテンプレート。持ち主の決まりは 068 と同じ・insert は owner_user_id / name / lines / sort・
 //     update は name / sort だけ・lines は 1〜30行の形の check・delete 可）
 //   migration 091（Task 77）: work_logs（現地の着・出と報告書・見積書を書いていた分。本人だけ書ける・本人と管理者が読める・消せない・列 grant・形の check）
-//   migration 090（Task 76）: reports.pdf_company（既定 true・画面から直接は変えられない）・rpc report_set_pdf_company。再編集のあとの再提出は
-//     次の対応を決めていなければ決めたときに「報告書を再提出しました（調査[・見積書提案期日 M/D]）」の1通（調査報告を再提出しました は出さない）
+//   migration 090（Task 76）: reports.pdf_company（既定 true・画面から直接は変えられない）・rpc report_set_pdf_company。
+//   migration 095（Task 81）: 再編集のあとの再提出は、次の対応を決めていなくても出し直した時点で「報告書を再提出しました（調査）」。
+//     決めたとき（report_decide_next）は再提出の文を重ねず「調査報告の次の対応を決めました（見積書提案期日 M/D）」（その他は送らない）。
+//     cancel_estimate_version は管理者か、その版を作った本人
 //   migration 089（Task 75）: rpc report_decide_next（次の対応を1回だけ決める）・case_summaries の reports に next_pending・不明の検査は方針があるときだけ
-//   rpc report_reedit / estimate_reedit（作業担当者・提出した人・作った人・管理者）・cancel_estimate_version（管理者だけ）・
+//   rpc report_reedit / estimate_reedit（作業担当者・提出した人・作った人・管理者）・cancel_estimate_version（管理者・095 から作った本人も）・
 //   share_state / share_reedit（担当者URL。anon も）。再編集・再提出は staff_messages（source reedit・宛先なし）とタイムライン。
 //   share_open の report.photos・reedit_count、share_submit は報告書に入っている写真をそのまま出し直せる（使用量は数え直さない）。
 //   再調査の再提出は2つ目の調査を作らない。case_summaries の phases[].estimates / reports に reedit_mark / reedit_at / reedit_by_name / reedit_count
@@ -1225,7 +1227,7 @@ const sb = (() => {
     return null;
   }
   // migration 037 reports_next_action: 調査の提出の「次の対応方針」→ 原因元工事の estimate_due（無ければ作る）・タイムライン
-  function reportNextAction(r) {
+  function reportNextAction(r, decide) { // 095: decide = report_decide_next から
     if (r.work_type !== 'investigate') return;
     // migration 040: 再調査の期限（A）。この報告書の調査フェーズまで（フェーズが無ければ全部）の調査の estimate_due を消す
     {
@@ -1307,10 +1309,11 @@ const sb = (() => {
       .concat(n.type === 'resurvey' ? ['再調査の理由: ' + String(n.reason || '').trim(), '再調査の内容: ' + String(n.detail || '').trim()] : [])
       .join('\n');
     const tail = rooms ? '\n\n■ 号室ごとの原因\n' + rooms : '';
-    // migration 090: 再編集のあとの再提出は「報告書を再提出しました（調査・見積書提案期日 M/D）」の1通（reportReeditAfter は送らない）
-    if (r.reedit_count > 0) reportReeditMsg(r, '見積書提案期日 ' + md, body, tail, signedIn ? user.id : null);
+    // migration 090: 方針つきの再提出（古い画面）は「報告書を再提出しました（調査・見積書提案期日 M/D）」の1通（reportReeditAfter は送らない）
+    // migration 095: 決める画面で決めたときは再提出の文を重ねない（再提出の連絡は提出のときに送った）
+    if (r.reedit_count > 0 && !decide) reportReeditMsg(r, '見積書提案期日 ' + md, body, tail, signedIn ? user.id : null);
     else db.staff_messages.push({ id: uuid(), org_id: r.org_id, case_id: r.case_id, phase_id: r.phase_id || null, from_user: signedIn ? user.id : null,
-      to_user: null, subject: '調査報告を提出しました（見積書提案期日 ' + md + '）', body: Array.from(body + tail).slice(0, 4000).join(''), attachments: [],
+      to_user: null, subject: (r.reedit_count > 0 ? '調査報告の次の対応を決めました' : '調査報告を提出しました') + '（見積書提案期日 ' + md + '）', body: Array.from(body + tail).slice(0, 4000).join(''), attachments: [],
       read_at: null, reply_to: null, created_at: nowIso(), source: 'report_submit' });
     return target.id; // 089: _report_next_apply は期日を入れたフェーズを返す
   }
@@ -1335,7 +1338,6 @@ const sb = (() => {
       if (pn[k] != null && typeof pn[k] !== 'string') throw P0001('送信内容が不正です');
       n[k] = pn[k] == null ? '' : pn[k];
     }
-    const pending = !!(r.data && r.data.nextPending === true); // 090: 提出のときに再提出の連絡を送っていない
     const data = Object.assign({}, isPlainObj(r.data) ? r.data : {}, { nextAction: n });
     delete data.nextPending;
     const err = reportDataCheck(data, r.work_type);
@@ -1343,8 +1345,7 @@ const sb = (() => {
     const keep = r.data;
     r.data = data;
     let phaseId;
-    try { phaseId = reportNextAction(r); } catch (e) { r.data = keep; throw e; }
-    if (type === 'other' && pending && r.reedit_count > 0) reportReeditMsg(r, '', '', '', user.id); // 090: その他に決めたときも再提出の連絡は1通
+    try { phaseId = reportNextAction(r, true); } catch (e) { r.data = keep; throw e; }
     r.updated_at = nowIso();
     return { ok: true, type, phase_id: phaseId || null };
   }
@@ -2786,8 +2787,7 @@ const sb = (() => {
     if (r.work_type === 'site_check') return; // 083: reportSiteCheckSent が「再送信しました」
     const n = r.data && r.data.nextAction;
     if (r.work_type === 'investigate' && n && typeof n === 'object' && ['cause', 'resurvey'].includes(n.type)) return; // reports_next_action が送る
-    // migration 090: 次の対応をまだ決めていない調査の報告書は、決めたとき（report_decide_next）に1通だけ送る
-    if (r.work_type === 'investigate' && r.data && r.data.nextPending === true && !(n && n.type)) return;
+    // migration 095: 次の対応をまだ決めていない調査の報告書も、出し直した時点で送る（090 の「決めたときに送る」はやめた）
     reportReeditMsg(r, '', '', '', r.submitted_via === 'share' ? null : (signedIn ? user.id : null));
   }
   // migration 090 _report_reedit_msg: 「報告書を再提出しました（調査[・見積書提案期日 M/D]）」。from は auth.uid()（担当者URLなら空）
@@ -2828,9 +2828,10 @@ const sb = (() => {
     return { ok: true, id: e.id, status: 'draft', reedit_count: e.reedit_count };
   }
   function cancelEstimateVersion(args) {
-    if (myRole() !== 'owner') throw pgErr('前の版に戻せるのは管理者だけです', '42501');
     const e = db.estimates.find(x => x.id === (args && args.p_id) && x.org_id === ORG_ID);
     if (!e) throw P0001('見積書が見つかりません');
+    // 095: 管理者か、その版を作った本人
+    if (myRole() !== 'owner' && e.created_by !== user.id) throw pgErr('前の版に戻せるのは、管理者と、その版を作った人だけです', '42501');
     if (e.status !== 'draft' || e.version < 2 || e.number) throw P0001('まだ提出していない第2版以降の下書きだけ、やめて前の版に戻せます');
     if (db.estimates.some(x => x.series_id === e.series_id && x.version > e.version)) throw P0001('この版より新しい版があります。見積書一覧を開き直してください');
     const pv = db.estimates.find(x => x.series_id === e.series_id && x.version === e.version - 1);
